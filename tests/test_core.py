@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 from scm_db.common import *
 from scm_db.settings import Settings,read_env
-from scm_db.database import Database,source_fingerprint
+from scm_db.database import Database,source_fingerprint,legacy_source_fingerprint
 from scm_db.normalize import normalize
 from scm_db.demo import demo_config,fake_tables,stage_tables,event
 from scm_db.reference import publish,project_cached
