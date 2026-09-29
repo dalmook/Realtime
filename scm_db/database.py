@@ -24,6 +24,77 @@ def choose_journal():
     safe=v>=(3,51,3) or (v[:2]==(3,50) and v>=(3,50,7)) or (v[:2]==(3,44) and v>=(3,44,6))
     return 'WAL' if safe else 'DELETE'
 
+LEGACY_FINGERPRINT_EXCLUDED={'poll_seconds','overlap_seconds','max_events','bootstrap','enabled','max_window_seconds','notes','mapping_confirmed'}
+FINGERPRINT_EXCLUDED=LEGACY_FINGERPRINT_EXCLUDED|{'title','inventory_semantics_confirmed','allow_payload_migration'}
+
+def source_fingerprint(d):
+    return digest({k:v for k,v in d.items() if k not in FINGERPRINT_EXCLUDED})
+
+def legacy_source_fingerprint(d):
+    return digest({k:v for k,v in d.items() if k not in LEGACY_FINGERPRINT_EXCLUDED})
+
+def compatible_legacy_fingerprints(d):
+    # Older builds fingerprinted display/confirmation metadata. Accept only hashes
+    # obtainable by removing non-semantic metadata; business mappings are untouched.
+    optional=('allow_payload_migration','inventory_semantics_confirmed','title')
+    out=set()
+    for mask in range(1<<len(optional)):
+        item=copy.deepcopy(d)
+        for i,key in enumerate(optional):
+            if mask&(1<<i): item.pop(key,None)
+        out.add(legacy_source_fingerprint(item))
+    return out
+
+def _event_for_existing_fact(con,old):
+    raw=con.execute("""SELECT event_us,indexed_us FROM raw_splunk_event
+      WHERE source_id=? AND event_hash=?""",(old['source_id'],old['event_hash'])).fetchone()
+    event_us=(raw['event_us'] if raw and raw['event_us'] else old['modified_us'])
+    indexed_us=(raw['indexed_us'] if raw and raw['indexed_us'] else old['indexed_us'])
+    return {'_raw':old['payload_json'],'event_epoch':event_us/1_000_000,'indexed_epoch':indexed_us/1_000_000}
+
+def renormalize_current_source(con,d):
+    """Safely re-project latest facts from their preserved payload without reset/backfill."""
+    from .normalize import normalize
+    table=d['domain']+'_current'; source_id=d['id']
+    count=con.execute(f'SELECT COUNT(*) FROM {table} WHERE source_id=?',(source_id,)).fetchone()[0]
+    if not count:return {'rows':0,'changed_fields':[]}
+    changed=set()
+    # Validate every latest row before writing anything.
+    cur=con.execute(f'SELECT * FROM {table} WHERE source_id=? ORDER BY record_key',(source_id,))
+    while True:
+        batch=cur.fetchmany(1000)
+        if not batch:break
+        for old in batch:
+            try:
+                payload=json.loads(old['payload_json'])
+                tab=text(payload.get('TABNAME'))
+                if d.get('table') and tab!=d['table']:
+                    raise DataError(f"TABNAME 불일치: {tab or '(blank)'} != {d['table']}")
+                new,_=normalize(d,_event_for_existing_fact(con,old))
+            except Exception as exc:
+                raise ConfigError(f"{source_id}: 기존 원문을 새 매핑으로 검증 실패 · key={old['record_key']} · {safe_error(exc)}") from None
+            if new['record_key']!=old['record_key']:
+                raise ConfigError(f"{source_id}: 업무키 변경 감지 · 기존 {old['record_key']} / 새 {new['record_key']}. 자동이관 중단")
+            if new['scope_ok']!=old['scope_ok'] or new['deleted']!=old['deleted']:
+                raise ConfigError(f"{source_id}: scope/delete 의미 변경 감지 · key={old['record_key']}. 자동이관 중단")
+            for col in FACT_COLUMNS:
+                if col not in {'source_id','record_key','event_hash'} and new[col]!=old[col]:changed.add(col)
+    # Re-normalize after validation and atomically update the current projection.
+    writable=[c for c in FACT_COLUMNS if c not in {'source_id','record_key','event_hash'}]
+    cur=con.execute(f'SELECT * FROM {table} WHERE source_id=? ORDER BY record_key',(source_id,))
+    while True:
+        batch=cur.fetchmany(500)
+        if not batch:break
+        updates=[]
+        for old in batch:
+            new,_=normalize(d,_event_for_existing_fact(con,old))
+            updates.append([new[c] for c in writable]+[source_id,old['record_key']])
+        con.executemany(f"UPDATE {table} SET "+','.join(f'{c}=?' for c in writable)+" WHERE source_id=? AND record_key=?",updates)
+    con.execute('DELETE FROM fact_valuation WHERE source_id=?',(source_id,))
+    for row in con.execute(f'SELECT * FROM {table} WHERE source_id=?',(source_id,)):
+        value_fact(con,row)
+    return {'rows':count,'changed_fields':sorted(changed)}
+
 class Database:
     def __init__(self,path,root): self.path=Path(path); self.root=Path(root)
     def connect(self,readonly=False):
@@ -54,7 +125,7 @@ class Database:
             if versions and max(versions)>1: raise ConfigError('이 프로그램보다 새로운 DB입니다. 덮어쓰지 않습니다')
             con.execute('PRAGMA journal_mode='+choose_journal())
             had_component=bool(con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dim_conversion_component'").fetchone())
-            material_remaps=[]
+            metadata_rebases=[];payload_remaps=[]
             migration_needed=False
             if versions:
                 if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fact_valuation'").fetchone():
@@ -69,11 +140,10 @@ class Database:
                     for d in config['splunk_sources']:
                         old=con.execute('SELECT * FROM source_state WHERE source_id=?',(d['id'],)).fetchone()
                         if not old or old['config_hash']==source_fingerprint(d) or not old['watermark']: continue
-                        legacy=copy.deepcopy(d)
-                        if d['id']=='inbound_dep' and d.get('fields',{}).get('material')=='MATNR':
-                            legacy['fields']['material']='P_CODE'
-                            if old['config_hash']==source_fingerprint(legacy):
-                                material_remaps.append(d['id']);migration_needed=True
+                        if old['config_hash'] in compatible_legacy_fingerprints(d):
+                            metadata_rebases.append(d['id'])
+                        elif d.get('allow_payload_migration',False):
+                            payload_remaps.append(d['id']);migration_needed=True
             if migration_needed:self.backup()
             con.executescript((self.root/'sql/001_schema.sql').read_text(encoding='utf-8'))
             existing={r[1] for r in con.execute('PRAGMA table_info(fact_valuation)')}
@@ -90,22 +160,22 @@ class Database:
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_record ON {table}(record_key)')
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_report ON {table}(plant,scope_ok,deleted,business_date)')
             con.execute('CREATE INDEX IF NOT EXISTS ix_shipment_amount_latest ON shipment_amount_current(record_key,modified_us DESC,generated_us DESC,indexed_us DESC,source_id)')
-            for source_id in material_remaps:
-                missing=con.execute("""SELECT COUNT(*) FROM inbound_current
-                  WHERE source_id=? AND COALESCE(TRIM(CAST(json_extract(payload_json,'$.MATNR') AS TEXT)),'')=''""",(source_id,)).fetchone()[0]
-                if missing:
-                    raise ConfigError(f'{source_id}: 기존 {missing}행에 MATNR가 없어 P_CODE→MATNR 자동이관을 중단합니다. 원천 backfill/reset이 필요합니다')
-                con.execute("""UPDATE inbound_current SET material=TRIM(CAST(json_extract(payload_json,'$.MATNR') AS TEXT))
-                  WHERE source_id=?""",(source_id,))
-                con.execute('DELETE FROM fact_valuation WHERE source_id=?',(source_id,))
+            remap_notes={}
+            for source_id in payload_remaps:
+                d=next(x for x in config['splunk_sources'] if x['id']==source_id)
+                info=renormalize_current_source(con,d)
+                remap_notes[source_id]=f"PAYLOAD_REMAP rows={info['rows']} fields={','.join(info['changed_fields']) or '(none)'}"
+            for source_id in metadata_rebases:
+                remap_notes[source_id]='FINGERPRINT_METADATA_REBASE'
             for d in config['splunk_sources']:
                 h=source_fingerprint(d)
                 old=con.execute('SELECT * FROM source_state WHERE source_id=?',(d['id'],)).fetchone()
-                if old and old['config_hash']!=h and old['watermark'] and d['id'] not in material_remaps:
-                    raise ConfigError(f"{d['id']}: 원천/키/매핑 변경 감지. 중지 후 새 source id로 등록하거나 reset-source --confirm 실행하세요")
-                con.execute('''INSERT INTO source_state(source_id,domain,enabled,config_hash) VALUES(?,?,?,?)
-                  ON CONFLICT(source_id) DO UPDATE SET enabled=excluded.enabled,config_hash=excluded.config_hash''',
-                  (d['id'],d['domain'],int(d.get('enabled',False)),h))
+                if old and old['config_hash']!=h and old['watermark'] and d['id'] not in remap_notes:
+                    raise ConfigError(f"{d['id']}: 원천/키/매핑 변경 감지. 자동 검증이 불가능하여 중단했습니다. DB/reset-source는 하지 말고 매핑을 확인하세요")
+                con.execute('''INSERT INTO source_state(source_id,domain,enabled,config_hash,projection_note) VALUES(?,?,?,?,?)
+                  ON CONFLICT(source_id) DO UPDATE SET enabled=excluded.enabled,config_hash=excluded.config_hash,
+                    projection_note=CASE WHEN excluded.projection_note<>'' THEN excluded.projection_note ELSE source_state.projection_note END''',
+                  (d['id'],d['domain'],int(d.get('enabled',False)),h,remap_notes.get(d['id'],'')))
             for d in config['oracle_sources']:
                 con.execute('''INSERT INTO reference_state(source_id,oracle_table,kind) VALUES(?,?,?)
                  ON CONFLICT(source_id) DO UPDATE SET oracle_table=excluded.oracle_table,kind=excluded.kind''',(d['id'],d['table'],d['kind']))
@@ -113,7 +183,7 @@ class Database:
                 con.execute("""UPDATE reference_state SET projection_ready=0,projection_note='CONVERSION_RESYNC_REQUIRED'
                   WHERE source_id='conversion' AND snapshot_id IS NOT NULL""")
                 con.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='reference_revision'")
-            if material_remaps or (versions and not had_component):revalue_all(con)
+            if versions and not had_component:revalue_all(con)
             con.commit()
             con.executescript((self.root/'sql/002_views.sql').read_text(encoding='utf-8'))
         finally: con.close()
@@ -211,10 +281,6 @@ class Database:
             con.execute('DELETE FROM etl_run WHERE ended_at<?',(cutoff,))
             con.execute('DELETE FROM data_issue WHERE created_at<?',(cutoff,))
             # Current facts and monthly targets are NEVER removed by raw-log retention.
-
-def source_fingerprint(d):
-    excluded={'poll_seconds','overlap_seconds','max_events','bootstrap','enabled','max_window_seconds','notes','mapping_confirmed'}
-    return digest({k:v for k,v in d.items() if k not in excluded})
 
 def value_fact(con,r):
     rev=int(con.execute("SELECT value FROM meta WHERE key='reference_revision'").fetchone()[0])
