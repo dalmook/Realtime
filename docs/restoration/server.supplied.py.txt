@@ -1,0 +1,1517 @@
+#!/usr/bin/env python3
+"""
+SCM Realtime LIVE Control Dashboard - Backend API Server
+Pure Python stdlib (http.server) - no external framework dependency.
+
+13-point overhaul (2026-09-28):
+  1. Named-parameter placeholders (no more wh_bind*3 / pg_bind*3 / etc.)
+  2. MTD = month_start <= business_date <= as_of_date; independent as_of dates
+  3. Common filter builder for inbound / shipment
+  4. date/customer/warehouse/product_group/item/metric filters across all APIs
+  5. Target filtered same dimension as actual; target_available=false when absent
+  6. SCALE is storage multiplier only; API returns real EA/EQ_DRAM/EQ_FLASH/BOX/USD
+  7. dim_conversion uniqueness verified; missing-conversion count exposed
+  8. Customers: Top N + 기타 = 전체 (separate total, not Top20 sum)
+  9. Items: inbound/shipment union (no LEFT JOIN on inbound Top30)
+ 10. Inventory: null + status=not_available for unavailable metrics; no target
+ 11. Inbound progress: simulated=true (no real status data)
+ 12. All date math via datetime; previous_business_date returned
+ 13. json_response() helper, Content-Length, param validation, safe static serving
+"""
+from __future__ import annotations
+import json, sqlite3, os, sys, threading, time
+from datetime import datetime, timedelta, date
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+
+import target_manager  # Dynamic Target Rule Manager
+import focus_manager   # Focus Item Manager (집중관리 아이템)
+
+# ── Config ──────────────────────────────────────────────
+DB_PATH = os.environ.get(
+    "SCM_LIVE_DB",
+    r"C:\Users\MASKED_USER\AppData\Local\SCMRealtimeDB\live\scm_live.sqlite",
+)
+STATIC_DIR = Path(__file__).parent / "static"
+PORT = int(os.environ.get("DASH_PORT", "8765"))
+SCALE = 1_000_000  # qty_i / amount_i are raw × 1,000,000 in DB
+
+EXCLUDED_WAREHOUSES = ("63D0", "63J0", "63P0", "13H0")
+VALID_METRICS = ("EA", "EQ_DRAM", "EQ_FLASH", "BOX", "USD")
+MAX_LIMIT = 500
+
+WH_MAP = {
+    "13V0": "베트남_밸류", "13Z0": "아레나스(3F)", "13Y0": "아레나스(6F)",
+    "1310": "온양", "1380": "인천", "53G0": "홍콩2", "63N0": "소주(NEW)",
+    "63H0": "푸동", "63S0": "서안", "53P0": "클락", "53V0": "베트남_한양",
+    "53W0": "베트남_밸류",
+}
+
+VKORG_MAP = {
+    "A001": "Samsung DS Korea", "A002": "Samsung Electronics Korea",
+    "U001": "Overseas US", "4501": "Overseas EU",
+    "3201": "Overseas China", "1142": "Overseas JP", "1143": "Overseas JP2",
+    "6S11": "Overseas TW", "6G01": "Overseas SEA",
+    "X031": "Overseas Other",
+}
+
+# ── Response cache (param-order independent) ───────────────
+_CACHE_TTL = 10
+_cache_lock = threading.Lock()
+_cache_store: dict[str, tuple[float, bytes]] = {}
+
+def _cache_key(path: str, params: dict) -> str:
+    """Sort params so ?a=1&b=2 and ?b=2&a=1 share the same cache key."""
+    items = sorted(params.items())
+    return path + "?" + "&".join(f"{k}={v[0] if isinstance(v, list) else v}" for k, v in items)
+
+def cache_get(key: str) -> bytes | None:
+    with _cache_lock:
+        entry = _cache_store.get(key)
+        if entry and time.time() - entry[0] < _CACHE_TTL:
+            return entry[1]
+        if entry:
+            del _cache_store[key]
+    return None
+
+def cache_set(key: str, data: bytes):
+    with _cache_lock:
+        if len(_cache_store) > 200:
+            _cache_store.clear()
+        _cache_store[key] = (time.time(), data)
+
+# ── DB helper ─────────────────────────────────────────────
+_wal_initialized = False
+
+def get_db():
+    global _wal_initialized
+    if not _wal_initialized:
+        w = sqlite3.connect(DB_PATH, timeout=30)
+        w.execute("PRAGMA journal_mode=WAL")
+        w.execute("PRAGMA mmap_size=268435456")
+        w.close()
+        _wal_initialized = True
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
+
+# ── Date helpers (no int(YYYYMMDD) arithmetic) ─────────────
+def today_str() -> str:
+    return datetime.now().strftime("%Y%m%d")
+
+def parse_yyyymmdd(s: str) -> date | None:
+    if not s or len(s) != 8:
+        return None
+    try:
+        return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except (ValueError, TypeError):
+        return None
+
+def fmt_yyyymmdd(d: date) -> str:
+    return d.strftime("%Y%m%d")
+
+def month_start(d: str) -> str:
+    """YYYYMMDD -> YYYYMM01"""
+    return d[:6] + "01"
+
+def previous_date(d: str) -> str | None:
+    dt = parse_yyyymmdd(d)
+    if dt is None:
+        return None
+    return fmt_yyyymmdd(dt - timedelta(days=1))
+
+def current_month() -> str:
+    return datetime.now().strftime("%Y%m")
+
+# ── Latest dates (no cache — query every call, exclude future) ──
+def get_latest_dates(con) -> dict:
+    _today = today_str()
+    inb = con.execute(
+        "SELECT MAX(business_date) d FROM inbound_current WHERE deleted=0 AND plant='P1M1' "
+        "AND c_id IN ('CO','GO') AND warehouse NOT IN (?,?,?,?) "
+        "AND i_type != '34' AND business_date <= ?",
+        (*EXCLUDED_WAREHOUSES, _today),
+    ).fetchone()
+    shp = con.execute(
+        "SELECT MAX(business_date) d FROM shipment_current WHERE deleted=0 "
+        "AND plant='P1M1' AND document_no LIKE '6%' AND business_date <= ?",
+        (_today,),
+    ).fetchone()
+    shp_box = con.execute(
+        "SELECT MAX(business_date) d FROM shipment_box_current WHERE deleted=0 "
+        "AND plant='P1M1' AND document_no LIKE '6%' "
+        "AND warehouse NOT IN (?,?,?,?) AND business_date <= ?",
+        (*EXCLUDED_WAREHOUSES, _today),
+    ).fetchone()
+    return {
+        "inbound": inb["d"] or _today,
+        "shipment": shp["d"] or _today,
+        "shipment_box": shp_box["d"] or (shp["d"] or _today),
+    }
+
+# ── Param extraction & validation ─────────────────────────
+def _p(params: dict, key: str, default: str | None = None) -> str | None:
+    """Get single param value or None."""
+    v = params.get(key)
+    if v is None:
+        return default
+    return v[0] if isinstance(v, list) else v
+
+def validate_params(params: dict) -> tuple[dict | None, str | None]:
+    """Validate date/month/metric/limit params. Returns (clean_params, error_msg)."""
+    d = _p(params, "date")
+    if d:
+        if len(d) != 8 or not d.isdigit():
+            return None, f"Invalid date format: {d} (expected YYYYMMDD)"
+    m = _p(params, "month")
+    if m:
+        if len(m) != 6 or not m.isdigit():
+            return None, f"Invalid month format: {m} (expected YYYYMM)"
+    metric = _p(params, "metric")
+    if metric:
+        metric = metric.upper()
+        if metric not in VALID_METRICS:
+            return None, f"Invalid metric: {metric} (valid: {','.join(VALID_METRICS)})"
+        params["metric"] = [metric]
+    lim = _p(params, "limit")
+    if lim:
+        try:
+            lim_int = int(lim)
+            if lim_int < 1 or lim_int > MAX_LIMIT:
+                return None, f"Invalid limit: {lim_int} (1..{MAX_LIMIT})"
+        except ValueError:
+            return None, f"Invalid limit: {lim} (must be integer)"
+    return params, None
+
+# ── Common filter builder ─────────────────────────────────
+class FilterBuilder:
+    """Builds WHERE clauses with named :placeholders for safe binding."""
+
+    def __init__(self):
+        self._clauses: list[str] = []
+        self._params: dict[str, object] = {}
+        self._counter = 0
+
+    def add_raw(self, clause: str, named_params: dict[str, object] | None = None):
+        """Add a clause with explicit :name placeholders already in the string.
+        The caller supplies the matching named_params."""
+        self._clauses.append(clause)
+        if named_params:
+            self._params.update(named_params)
+
+    def add(self, clause_with_placeholder: str, value: object):
+        """Add a clause containing exactly one '?' which will be replaced
+        by a unique :paramN placeholder."""
+        name = f"p{self._counter}"
+        self._counter += 1
+        self._params[name] = value
+        self._clauses.append(clause_with_placeholder.replace("?", f":{name}", 1))
+
+    @property
+    def where(self) -> str:
+        return " AND ".join(self._clauses) if self._clauses else "1=1"
+
+    @property
+    def params(self) -> dict:
+        return self._params
+
+    def append_clause(self, clause: str):
+        """Append a raw clause with no new params (params already in self._params)."""
+        self._clauses.append(clause)
+
+    def merge_params(self, extra: dict):
+        self._params.update(extra)
+
+
+_EX_WH_PARAMS = {
+    "ex_wh1": EXCLUDED_WAREHOUSES[0],
+    "ex_wh2": EXCLUDED_WAREHOUSES[1],
+    "ex_wh3": EXCLUDED_WAREHOUSES[2],
+    "ex_wh4": EXCLUDED_WAREHOUSES[3],
+}
+
+def _inbound_base_filter(fb: FilterBuilder, as_of: str | None = None):
+    """Common inbound filter: deleted=0, plant='P1M1', c_id IN ('CO','GO'),
+    excluded warehouses, i_type != '34'."""
+    fb.append_clause("deleted=0")
+    fb.append_clause("plant='P1M1'")
+    fb.append_clause("c_id IN ('CO','GO')")
+    fb.append_clause("warehouse NOT IN (:ex_wh1,:ex_wh2,:ex_wh3,:ex_wh4)")
+    fb.merge_params(_EX_WH_PARAMS)
+    fb.append_clause("i_type != '34'")
+    if as_of:
+        fb.add("business_date <= ?", as_of)
+
+def _shipment_base_filter(fb: FilterBuilder, as_of: str | None = None):
+    """Common shipment filter: deleted=0, plant='P1M1', document_no LIKE '6%',
+    excluded warehouses."""
+    fb.append_clause("deleted=0")
+    fb.append_clause("plant='P1M1'")
+    fb.append_clause("document_no LIKE '6%'")
+    fb.append_clause("warehouse NOT IN (:ex_wh1,:ex_wh2,:ex_wh3,:ex_wh4)")
+    fb.merge_params(_EX_WH_PARAMS)
+    if as_of:
+        fb.add("business_date <= ?", as_of)
+
+def _add_user_filters(fb: FilterBuilder, params: dict, params_key: str = None, is_shipment: bool = False):
+    """Add date/customer/warehouse/product_group/item filters from query params.
+
+    When is_shipment=True, customer filter uses COALESCE(k.kunag, customer_key)
+    to match ZTSDJK0120 KUNAG (with fallback to VBRP customer_key).
+    Requires _SHIP_AMT_JOIN in the FROM clause.
+    """
+    tgt_wh = _p(params, "warehouse")
+    if tgt_wh and tgt_wh != "ALL":
+        fb.add("warehouse = ?", tgt_wh)
+    tgt_cust = _p(params, "customer")
+    if tgt_cust and tgt_cust != "ALL":
+        if is_shipment:
+            fb.add("COALESCE(k.kunag, customer_key) = ?", tgt_cust)
+        else:
+            fb.add("customer_key = ?", tgt_cust)
+    tgt_pg = _p(params, "product_group")
+    if tgt_pg and tgt_pg != "ALL":
+        fb.add("substr(material,1,18) IN (SELECT substr(material,1,18) FROM dim_product WHERE product_group = ?)", tgt_pg)
+    tgt_item = _p(params, "item")
+    if tgt_item and tgt_item != "ALL":
+        fb.add("substr(material,1,18) = ?", tgt_item)
+
+# ── Metric helpers ────────────────────────────────────────
+def _eq_join_clause(table: str, unit: str) -> str:
+    """LEFT JOIN dim_conversion for EQ_DRAM / EQ_FLASH."""
+    return (
+        f" LEFT JOIN (SELECT material AS conv_mat, eq_per_unit "
+        f"FROM dim_conversion WHERE unit = '{unit}') "
+        f"ON substr({table}.material,1,18) = conv_mat"
+    )
+
+_SHIP_AMT_JOIN = (
+    "LEFT JOIN shipment_amount_kzwi3 k "
+    "ON json_extract(record_key, '$[0]') = k.vbeln "
+    "AND json_extract(record_key, '$[1]') = k.posnr"
+)
+
+# For queries that alias shipment_current as s, use _SHIP_AMT_JOIN_S
+_SHIP_AMT_JOIN_S = (
+    "LEFT JOIN shipment_amount_kzwi3 k "
+    "ON json_extract(s.record_key, '$[0]') = k.vbeln "
+    "AND json_extract(s.record_key, '$[1]') = k.posnr"
+)
+
+def _val_expr(metric: str, tbl: str = "", direction: str = "") -> str:
+    """SQL expression for the given metric's value column.
+    direction='shipment' → use KZWI3 (ZTSDJK0120) for USD;
+    otherwise → use amount_i (NETWR * SCALE) for USD (inbound fallback).
+    """
+    pfx = f"{tbl}." if tbl else ""
+    if metric == "EA":
+        return f"{pfx}qty_i"
+    elif metric == "USD":
+        if direction == "shipment":
+            # KZWI3 (ZTSDJK0120) = billing/revenue amount, already in USD.
+            # No fallback to amount_i — unmatched rows have no reliable USD value
+            # (amount_i may contain KRW values misinterpreted as USD).
+            # Multiply by SCALE so _descale (divides by SCALE) yields correct KZWI3.
+            return f"k.kzwi3 * {SCALE}"
+        # Inbound: no KZWI3 available, use NETWR * SCALE directly
+        return f"{pfx}amount_i"
+    elif metric == "BOX":
+        return f"{pfx}box_no"
+    elif metric in ("EQ_DRAM", "EQ_FLASH"):
+        return f"{pfx}qty_i * CAST(eq_per_unit AS REAL)"
+    return f"{pfx}qty_i"
+
+def _descale(val, metric: str) -> float:
+    """Convert DB stored value to display value (undo SCALE multiplier)."""
+    if val is None:
+        return 0.0
+    if metric == "BOX":
+        # BOX is COUNT(DISTINCT box_no) for inbound, SUM(qty_i)/SCALE for shipment
+        # Already counted as integer — no SCALE
+        return float(val)
+    return float(val) / SCALE
+
+def _plan_target(con, direction: str, metric: str, ym: str) -> tuple[int, bool]:
+    """plan_monthly에서 해당 metric의 목표 조회.
+    Returns (target_raw, target_available).
+    For EQ_DRAM/EQ_FLASH: EA target × dim_conversion eq_per_unit.
+    For BOX: no plan data → target_available=False.
+    """
+    if metric == "BOX":
+        return 0, False
+    if metric in ("EQ_DRAM", "EQ_FLASH"):
+        unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH"
+        row = con.execute(
+            """SELECT COALESCE(SUM(p.target_i * CAST(dc.eq_per_unit AS REAL)),0) tgt
+               FROM plan_monthly p
+               LEFT JOIN dim_conversion dc
+                 ON substr(p.material,1,18)=dc.material AND dc.unit=?
+               WHERE p.direction=? AND p.metric='EA' AND p.period_ym=?""",
+            [unit, direction, ym],
+        ).fetchone()
+        return row["tgt"], row["tgt"] > 0
+    row = con.execute(
+        "SELECT COALESCE(SUM(target_i),0) tgt FROM plan_monthly WHERE direction=? AND metric=? AND period_ym=?",
+        [direction, metric, ym],
+    ).fetchone()
+    return row["tgt"], row["tgt"] > 0
+
+def _previous_business_date(con, table: str, base_filter_where: str, base_params: dict, d: str) -> str | None:
+    """Find the previous date with data before the given date."""
+    row = con.execute(
+        f"SELECT MAX(business_date) d FROM {table} WHERE {base_filter_where} AND business_date < :prev_d",
+        {**base_params, "prev_d": d},
+    ).fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+# ════════════════════════════════════════════════════════════
+#  API HANDLERS
+# ════════════════════════════════════════════════════════════
+
+def api_kpi(params: dict) -> dict:
+    """상단 KPI: 생산(입고), 출하, 재고
+    - metric: EA(기본) / EQ_DRAM / EQ_FLASH / BOX / USD
+    - target/actual: MTD 누적, yesterday: 전일, achievement: 달성률
+    - MTD = month_start <= business_date <= as_of_date
+    - 입고/출하 as_of 독립 관리 (inbound_as_of, shipment_as_of)
+    """
+    metric = (_p(params, "metric", "EA") or "EA").upper()
+    if metric not in VALID_METRICS:
+        metric = "EA"
+    _is_eq = metric in ("EQ_DRAM", "EQ_FLASH")
+    _eq_unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH" if metric == "EQ_FLASH" else None
+
+    con = get_db()
+    try:
+        dates = get_latest_dates(con)
+        _today = today_str()
+        inb_as_of = _p(params, "date") or dates["inbound"]
+        shp_as_of = _p(params, "date") or (dates["shipment_box"] if metric == "BOX" else dates["shipment"])
+
+        # Cap to latest available + today
+        if inb_as_of > dates["inbound"]:
+            inb_as_of = dates["inbound"]
+        if shp_as_of > dates["shipment"]:
+            shp_as_of = dates["shipment"]
+        if inb_as_of > _today:
+            inb_as_of = _today
+        if shp_as_of > _today:
+            shp_as_of = _today
+
+        inb_ym = inb_as_of[:6]
+        shp_ym = shp_as_of[:6]
+        inb_mstart = month_start(inb_as_of)
+
+        # ── Build inbound base filter ──
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+
+        # ── Build shipment base filter ──
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        _add_user_filters(fb_shp, params, is_shipment=True)
+
+        # ── Previous business dates ──
+        prev_inb_d = _previous_business_date(con, "inbound_current", fb_inb.where, fb_inb.params, inb_as_of) or inb_as_of
+        prev_shp_d = _previous_business_date(con, "shipment_current", fb_shp.where, fb_shp.params, shp_as_of) or shp_as_of
+
+        # ── EQ JOIN clause ──
+        inb_eq_join = _eq_join_clause("inbound_current", _eq_unit) if _is_eq else ""
+        shp_eq_join = _eq_join_clause("shipment_current", _eq_unit) if _is_eq else ""
+        shp_amt_join = _SHIP_AMT_JOIN  # Always join KZWI3 for KUNAG/SONAME customer filter
+
+        # ── Value expression ──
+        inb_ve = _val_expr(metric)
+        shp_ve = _val_expr(metric, direction="shipment")
+
+        # ── Inbound combined query (MTD + today + yesterday) ──
+        if metric == "BOX":
+            inb_mtd_expr = "COUNT(DISTINCT CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN box_no END)"
+            inb_today_expr = "COUNT(DISTINCT CASE WHEN business_date = :today_d THEN box_no END)"
+            inb_yest_expr = "COUNT(DISTINCT CASE WHEN business_date = :yest_d THEN box_no END)"
+        else:
+            inb_mtd_expr = f"COALESCE(SUM(CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN {inb_ve} ELSE 0 END),0)"
+            inb_today_expr = f"COALESCE(SUM(CASE WHEN business_date = :today_d THEN {inb_ve} ELSE 0 END),0)"
+            inb_yest_expr = f"COALESCE(SUM(CASE WHEN business_date = :yest_d THEN {inb_ve} ELSE 0 END),0)"
+
+        inb_combined = con.execute(
+            f"""
+            SELECT
+              SUM(CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN 1 ELSE 0 END) AS mtd_cnt,
+              {inb_mtd_expr} AS mtd_val,
+              SUM(CASE WHEN business_date = :today_d THEN 1 ELSE 0 END) AS today_cnt,
+              {inb_today_expr} AS today_val,
+              SUM(CASE WHEN business_date = :yest_d THEN 1 ELSE 0 END) AS yest_cnt,
+              {inb_yest_expr} AS yest_val
+            FROM inbound_current
+            {inb_eq_join}
+            WHERE {fb_inb.where}
+            AND (business_date >= :mstart AND business_date <= :as_of
+                 OR business_date = :today_d
+                 OR business_date = :yest_d)
+            """,
+            {
+                **fb_inb.params,
+                "mstart": inb_mstart, "as_of": inb_as_of,
+                "today_d": inb_as_of, "yest_d": prev_inb_d,
+            },
+        ).fetchone()
+
+        # ── Shipment combined query ──
+        shp_mstart = month_start(shp_as_of)
+        if metric == "BOX":
+            # BOX uses shipment_box_current table
+            fb_box = FilterBuilder()
+            _shipment_base_filter(fb_box)
+            _add_user_filters(fb_box, params)
+            prev_box_d = _previous_business_date(con, "shipment_box_current", fb_box.where, fb_box.params, shp_as_of) or shp_as_of
+            shp_mtd_expr = f"COALESCE(SUM(CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN box_no ELSE 0 END),0)"
+            shp_today_expr = f"COALESCE(SUM(CASE WHEN business_date = :today_d THEN box_no ELSE 0 END),0)"
+            shp_yest_expr = f"COALESCE(SUM(CASE WHEN business_date = :yest_d THEN box_no ELSE 0 END),0)"
+            shp_combined = con.execute(
+                f"""
+                SELECT
+                  SUM(CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN 1 ELSE 0 END) AS mtd_cnt,
+                  {shp_mtd_expr} AS mtd_val,
+                  SUM(CASE WHEN business_date = :today_d THEN 1 ELSE 0 END) AS today_cnt,
+                  {shp_today_expr} AS today_val,
+                  SUM(CASE WHEN business_date = :yest_d THEN 1 ELSE 0 END) AS yest_cnt,
+                  {shp_yest_expr} AS yest_val
+                FROM shipment_box_current
+                WHERE {fb_box.where}
+                AND (business_date >= :mstart AND business_date <= :as_of
+                     OR business_date = :today_d
+                     OR business_date = :yest_d)
+                """,
+                {
+                    **fb_box.params,
+                    "mstart": shp_mstart, "as_of": shp_as_of,
+                    "today_d": shp_as_of, "yest_d": prev_box_d,
+                },
+            ).fetchone()
+            prev_shp_d = prev_box_d
+        else:
+            shp_mtd_expr = f"COALESCE(SUM(CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN {shp_ve} ELSE 0 END),0)"
+            shp_today_expr = f"COALESCE(SUM(CASE WHEN business_date = :today_d THEN {shp_ve} ELSE 0 END),0)"
+            shp_yest_expr = f"COALESCE(SUM(CASE WHEN business_date = :yest_d THEN {shp_ve} ELSE 0 END),0)"
+            shp_combined = con.execute(
+                f"""
+                SELECT
+                  SUM(CASE WHEN business_date >= :mstart AND business_date <= :as_of THEN 1 ELSE 0 END) AS mtd_cnt,
+                  {shp_mtd_expr} AS mtd_val,
+                  SUM(CASE WHEN business_date = :today_d THEN 1 ELSE 0 END) AS today_cnt,
+                  {shp_today_expr} AS today_val,
+                  SUM(CASE WHEN business_date = :yest_d THEN 1 ELSE 0 END) AS yest_cnt,
+                  {shp_yest_expr} AS yest_val
+                FROM shipment_current
+                {shp_eq_join}
+                {shp_amt_join}
+                WHERE {fb_shp.where}
+                AND business_date <= :as_of
+                AND (business_date >= :mstart AND business_date <= :as_of
+                     OR business_date = :today_d
+                     OR business_date = :yest_d)
+                """,
+                {
+                    **fb_shp.params,
+                    "mstart": shp_mstart, "as_of": shp_as_of,
+                    "today_d": shp_as_of, "yest_d": prev_shp_d,
+                },
+            ).fetchone()
+
+        # ── Targets ──
+        plan_inb_raw, inb_target_avail = _plan_target(con, "inbound", metric, inb_ym)
+        plan_shp_raw, shp_target_avail = _plan_target(con, "shipment", metric, shp_ym)
+
+        # ── Inventory (0 rows → null + status) ──
+        inv_cnt = con.execute("SELECT COUNT(*) c FROM inventory_current WHERE deleted=0").fetchone()["c"]
+        inv_data = {"current": None, "available": None, "count": inv_cnt, "status": "not_available" if inv_cnt == 0 else "ok"}
+
+        if inv_cnt > 0:
+            fb_inv = FilterBuilder()
+            fb_inv.add("deleted=0")
+            _add_user_filters(fb_inv, params)
+            if _is_eq:
+                inv_eq_join = _eq_join_clause("inventory_current", _eq_unit)
+                inv_row = con.execute(
+                    f"""SELECT COALESCE(SUM(qty_i * CAST(eq_per_unit AS REAL)),0) val
+                        FROM inventory_current
+                        {inv_eq_join}
+                        WHERE {fb_inv.where}""",
+                    fb_inv.params,
+                ).fetchone()
+                inv_data["current"] = float(inv_row["val"]) / SCALE if inv_row["val"] else 0
+                inv_data["available"] = inv_data["current"]
+            elif metric == "BOX":
+                inv_row = con.execute(
+                    f"SELECT COUNT(DISTINCT box_no) val FROM inventory_current WHERE {fb_inv.where}",
+                    fb_inv.params,
+                ).fetchone()
+                inv_data["current"] = inv_row["val"] or 0
+                inv_data["available"] = inv_data["current"]
+            elif metric == "EA":
+                inv_row = con.execute(
+                    f"SELECT COALESCE(SUM(qty_i),0) val FROM inventory_current WHERE {fb_inv.where}",
+                    fb_inv.params,
+                ).fetchone()
+                inv_data["current"] = float(inv_row["val"]) / SCALE if inv_row["val"] else 0
+                inv_data["available"] = inv_data["current"]
+            else:
+                # USD / other: inventory has no amount data
+                inv_data["current"] = None
+                inv_data["available"] = None
+                inv_data["status"] = "not_available"
+
+        # ── Descale and compute ──
+        inb_mtd = _descale(inb_combined["mtd_val"], metric)
+        inb_today = _descale(inb_combined["today_val"], metric)
+        shp_mtd = _descale(shp_combined["mtd_val"], metric)
+        shp_today = _descale(shp_combined["today_val"], metric)
+        yest_inb = _descale(inb_combined["yest_val"], metric)
+        yest_shp = _descale(shp_combined["yest_val"], metric)
+
+        plan_inb = plan_inb_raw / SCALE if inb_target_avail else 0
+        plan_shp = plan_shp_raw / SCALE if shp_target_avail else 0
+
+        inb_ach = round(inb_mtd / plan_inb * 100, 1) if plan_inb and inb_target_avail else 0
+        shp_ach = round(shp_mtd / plan_shp * 100, 1) if plan_shp and shp_target_avail else 0
+
+        inb_yoy = round((inb_today - yest_inb) / max(yest_inb, 1) * 100, 1) if yest_inb else 0
+        shp_yoy = round((shp_today - yest_shp) / max(yest_shp, 1) * 100, 1) if yest_shp else 0
+
+        return {
+            "metric": metric,
+            "production": {
+                "target": plan_inb if inb_target_avail else None,
+                "target_available": inb_target_avail,
+                "actual_mtd": inb_mtd,
+                "actual_today": inb_today,
+                "count_mtd": inb_combined["mtd_cnt"],
+                "count_today": inb_combined["today_cnt"],
+                "achievement": inb_ach if inb_target_avail else None,
+                "yoy_change": inb_yoy,
+                "yesterday": yest_inb,
+                "date": inb_as_of,
+                "previous_business_date": prev_inb_d,
+            },
+            "shipment": {
+                "target": plan_shp if shp_target_avail else None,
+                "target_available": shp_target_avail,
+                "actual_mtd": shp_mtd,
+                "actual_today": shp_today,
+                "count_mtd": shp_combined["mtd_cnt"],
+                "count_today": shp_combined["today_cnt"],
+                "achievement": shp_ach if shp_target_avail else None,
+                "yoy_change": shp_yoy,
+                "yesterday": yest_shp,
+                "date": shp_as_of,
+                "previous_business_date": prev_shp_d,
+            },
+            "inventory": inv_data,
+            "date": inb_as_of,
+            "inbound_as_of": inb_as_of,
+            "shipment_as_of": shp_as_of,
+            "latest_inbound_date": dates["inbound"],
+            "latest_shipment_date": dates["shipment"],
+            "timestamp": datetime.now().isoformat(),
+        }
+    finally:
+        con.close()
+
+
+def api_hourly(params: dict) -> dict:
+    """시간대별 입고/출하 추이 (EA only — metric filter applies to value column)."""
+    metric = (_p(params, "metric", "EA") or "EA").upper()
+    if metric not in VALID_METRICS:
+        metric = "EA"
+    _is_eq = metric in ("EQ_DRAM", "EQ_FLASH")
+    _eq_unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH" if metric == "EQ_FLASH" else None
+
+    con = get_db()
+    try:
+        dates = get_latest_dates(con)
+        inb_as_of = _p(params, "date") or dates["inbound"]
+        shp_as_of = _p(params, "date") or dates["shipment"]
+        if inb_as_of > dates["inbound"]:
+            inb_as_of = dates["inbound"]
+        if shp_as_of > dates["shipment"]:
+            shp_as_of = dates["shipment"]
+
+        # Inbound hourly
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+        inb_eq_join = _eq_join_clause("inbound_current", _eq_unit) if _is_eq else ""
+        inb_ve = _val_expr(metric) if not _is_eq else "qty_i * CAST(eq_per_unit AS REAL)"
+
+        inb_rows = con.execute(
+            f"""
+            SELECT substr(business_time,1,2) AS hour,
+                   COUNT(*) cnt, COALESCE(SUM({inb_ve}),0) qty
+            FROM inbound_current
+            {inb_eq_join}
+            WHERE {fb_inb.where} AND business_date = :d
+            GROUP BY hour ORDER BY hour
+            """,
+            {**fb_inb.params, "d": inb_as_of},
+        ).fetchall()
+
+        # Shipment hourly
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        _add_user_filters(fb_shp, params, is_shipment=True)
+        shp_eq_join = _eq_join_clause("shipment_current", _eq_unit) if _is_eq else ""
+        shp_amt_join = _SHIP_AMT_JOIN  # Always join KZWI3 for KUNAG/SONAME customer filter
+        shp_ve = _val_expr(metric, direction="shipment") if not _is_eq else "qty_i * CAST(eq_per_unit AS REAL)"
+
+        shp_rows = con.execute(
+            f"""
+            SELECT substr(business_time,1,2) AS hour,
+                   COUNT(*) cnt, COALESCE(SUM({shp_ve}),0) qty
+            FROM shipment_current
+            {shp_eq_join}
+            {shp_amt_join}
+            WHERE {fb_shp.where} AND business_date = :d
+            GROUP BY hour ORDER BY hour
+            """,
+            {**fb_shp.params, "d": shp_as_of},
+        ).fetchall()
+
+        # Descale
+        sc = 1.0 if metric == "BOX" else SCALE
+        inb_map = {r["hour"]: float(r["qty"]) / sc for r in inb_rows}
+        shp_map = {r["hour"]: float(r["qty"]) / sc for r in shp_rows}
+
+        hours = [f"{h:02d}" for h in range(24)]
+        inb_series = [round(inb_map.get(h, 0), 1) for h in hours]
+        shp_series = [round(shp_map.get(h, 0), 1) for h in hours]
+
+        now_hour = datetime.now().hour
+
+        return {
+            "hours": hours,
+            "production": inb_series,
+            "shipment": shp_series,
+            "current_hour": now_hour,
+            "inbound_date": inb_as_of,
+            "shipment_date": shp_as_of,
+            "metric": metric,
+        }
+    finally:
+        con.close()
+
+
+def api_customers(params: dict) -> dict:
+    """거래선별 현황 — Top N + 기타 = 전체 (별도 전체 계산, share=전체 기준)."""
+    metric = (_p(params, "metric", "EA") or "EA").upper()
+    if metric not in VALID_METRICS:
+        metric = "EA"
+    con = get_db()
+    try:
+        dates = get_latest_dates(con)
+        inb_as_of = _p(params, "date") or dates["inbound"]
+        shp_as_of = _p(params, "date") or dates["shipment"]
+        if inb_as_of > dates["inbound"]:
+            inb_as_of = dates["inbound"]
+        if shp_as_of > dates["shipment"]:
+            shp_as_of = dates["shipment"]
+
+        tgt_range = _p(params, "range", "daily")
+
+        # Date range filter for shipment
+        if tgt_range == "weekly":
+            shp_dt = parse_yyyymmdd(shp_as_of)
+            if shp_dt:
+                start = fmt_yyyymmdd(shp_dt - timedelta(days=7))
+            else:
+                start = shp_as_of
+            date_clause = "business_date >= :start_d AND business_date <= :end_d"
+            date_params = {"start_d": start, "end_d": shp_as_of}
+        elif tgt_range == "monthly":
+            date_clause = "substr(business_date,1,6) = :ym"
+            date_params = {"ym": shp_as_of[:6]}
+        else:
+            date_clause = "business_date = :d"
+            date_params = {"d": shp_as_of}
+
+        # User filters (warehouse, product_group, item)
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        _add_user_filters(fb_shp, params, is_shipment=True)
+        fb_shp.append_clause(date_clause)
+        fb_shp.merge_params(date_params)
+
+        # ── Total shipment (ALL customers) ──
+        shp_total_row = con.execute(
+            f"""SELECT COUNT(*) cnt, COALESCE(SUM(qty_i),0) qty,
+                    COALESCE(SUM(k.kzwi3 * {SCALE}),0) amt
+                FROM shipment_current s
+                {_SHIP_AMT_JOIN_S}
+                WHERE {fb_shp.where}""",
+            fb_shp.params,
+        ).fetchone()
+        total_qty = float(shp_total_row["qty"]) / SCALE
+        total_amt = float(shp_total_row["amt"]) / SCALE
+
+        # ── Top N by customer (KUNAG from ZTSDJK0120, fallback to VBRP customer_key) ──
+        limit = min(int(_p(params, "limit", "20") or "20"), MAX_LIMIT)
+        shp_rows = con.execute(
+            f"""
+            SELECT COALESCE(k.kunag, s.customer_key) AS cust_key,
+                   COALESCE(k.soname, '') AS cust_name,
+                   json_extract(s.payload_json,'$.VKORG_ANA') vkorg,
+                   COUNT(*) cnt, COALESCE(SUM(s.qty_i),0) qty,
+                   COALESCE(SUM(k.kzwi3 * {SCALE}),0) amt
+            FROM shipment_current s
+            {_SHIP_AMT_JOIN_S}
+            WHERE {fb_shp.where}
+            GROUP BY cust_key, cust_name, vkorg
+            ORDER BY amt DESC
+            LIMIT :lim
+            """,
+            {**fb_shp.params, "lim": limit},
+        ).fetchall()
+
+        top_qty = sum(float(r["qty"]) for r in shp_rows) / SCALE
+        top_amt = sum(float(r["amt"]) for r in shp_rows) / SCALE
+
+        def _cust_name_fallback(key, soname, vk):
+            """Use SONAME from ZTSDJK0120 if available; fallback to old mapping for unmatched rows."""
+            if soname:
+                return soname
+            if not key:
+                return "미분류"
+            if key.startswith("C") and "-" in key:
+                org_map = {
+                    "C100-DS": "삼성전자 DS", "C320-00": "삼성전자 MX",
+                    "C114-00": "삼성SDI", "C450-00": "삼성전기",
+                    "C5D1-00": "삼성디스플레이", "C6G0-00": "삼성SDS",
+                    "C6S1-00": "삼성바이오로직스", "GE01-01": "해외법인",
+                }
+                return org_map.get(key, f"삼성 ({key})")
+            elif key.startswith("000"):
+                return f"외부거래선 ({key})"
+            return key
+
+        result = []
+        for r in shp_rows:
+            vk = r["vkorg"] or "N/A"
+            qty = float(r["qty"]) / SCALE
+            amt = float(r["amt"]) / SCALE
+            result.append({
+                "customer_key": r["cust_key"],
+                "name": _cust_name_fallback(r["cust_key"], r["cust_name"], vk),
+                "group": VKORG_MAP.get(vk, f"VKORG {vk}"),
+                "production": 0,
+                "shipment": qty,
+                "shipment_amount": amt,
+                "inventory": 0,
+                "share": round(amt / total_amt * 100, 1) if total_amt else 0,
+                "count": r["cnt"],
+            })
+
+        # 기타 (Others) row
+        others_qty = total_qty - top_qty
+        others_amt = total_amt - top_amt
+        if others_amt > 0 and len(shp_rows) >= limit:
+            result.append({
+                "customer_key": "__OTHERS__",
+                "name": "기타",
+                "group": "기타",
+                "production": 0,
+                "shipment": round(others_qty, 1),
+                "shipment_amount": round(others_amt, 1),
+                "inventory": 0,
+                "share": round(others_amt / total_amt * 100, 1) if total_amt else 0,
+                "count": 0,
+            })
+
+        # Inbound total (warehouse-based, no customer mapping)
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+        inb_total = con.execute(
+            f"SELECT COUNT(*) cnt, COALESCE(SUM(qty_i),0) qty FROM inbound_current WHERE {fb_inb.where} AND business_date = :d",
+            {**fb_inb.params, "d": inb_as_of},
+        ).fetchone()
+
+        return {
+            "customers": result,
+            "total_production": float(inb_total["qty"]) / SCALE,
+            "total_shipment": total_qty,
+            "total_shipment_amount": total_amt,
+            "range": tgt_range,
+            "inbound_date": inb_as_of,
+            "shipment_date": shp_as_of,
+            "metric": metric,
+        }
+    finally:
+        con.close()
+
+
+def api_items(params: dict) -> dict:
+    """주요 ITEM별 현황 — 입고/출하 전체 material 합집합 (no LEFT JOIN on inbound Top30)."""
+    metric = (_p(params, "metric", "EA") or "EA").upper()
+    if metric not in VALID_METRICS:
+        metric = "EA"
+    _is_eq = metric in ("EQ_DRAM", "EQ_FLASH")
+    _eq_unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH" if metric == "EQ_FLASH" else None
+    limit = min(int(_p(params, "limit", "30") or "30"), MAX_LIMIT)
+
+    con = get_db()
+    try:
+        dates = get_latest_dates(con)
+        inb_as_of = _p(params, "date") or dates["inbound"]
+        shp_as_of = _p(params, "date") or dates["shipment"]
+        if inb_as_of > dates["inbound"]:
+            inb_as_of = dates["inbound"]
+        if shp_as_of > dates["shipment"]:
+            shp_as_of = dates["shipment"]
+
+        # User filters
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        _add_user_filters(fb_shp, params, is_shipment=True)
+
+        inb_eq_join = _eq_join_clause("inbound_current", _eq_unit) if _is_eq else ""
+        shp_eq_join = _eq_join_clause("shipment_current", _eq_unit) if _is_eq else ""
+        shp_amt_join = _SHIP_AMT_JOIN  # Always join KZWI3 for KUNAG/SONAME customer filter
+        inb_ve = "qty_i * CAST(eq_per_unit AS REAL)" if _is_eq else _val_expr(metric)
+        shp_ve = "qty_i * CAST(eq_per_unit AS REAL)" if _is_eq else _val_expr(metric, direction="shipment")
+
+        # ── Inbound by material ──
+        inb_rows = con.execute(
+            f"""
+            SELECT substr(material,1,18) AS mat18,
+                   COUNT(*) cnt, COALESCE(SUM({inb_ve}),0) qty, 0 AS amt
+            FROM inbound_current
+            {inb_eq_join}
+            WHERE {fb_inb.where} AND business_date = :d
+            GROUP BY mat18
+            """,
+            {**fb_inb.params, "d": inb_as_of},
+        ).fetchall()
+
+        # ── Shipment by material ──
+        shp_rows = con.execute(
+            f"""
+            SELECT substr(material,1,18) AS mat18,
+                   COUNT(*) cnt, COALESCE(SUM({shp_ve}),0) qty,
+                   COALESCE(SUM(k.kzwi3 * {SCALE}),0) amt
+            FROM shipment_current
+            {shp_eq_join}
+            {shp_amt_join}
+            WHERE {fb_shp.where} AND business_date = :d
+            GROUP BY mat18
+            """,
+            {**fb_shp.params, "d": shp_as_of},
+        ).fetchall()
+
+        sc = 1.0 if metric == "BOX" else SCALE
+
+        # ── Union: inbound + shipment materials ──
+        inb_map = {}
+        for r in inb_rows:
+            inb_map[r["mat18"]] = {
+                "cnt": r["cnt"], "qty": float(r["qty"]) / sc, "amt": 0.0,
+            }
+        shp_map = {}
+        for r in shp_rows:
+            shp_map[r["mat18"]] = {
+                "cnt": r["cnt"], "qty": float(r["qty"]) / sc, "amt": float(r["amt"]) / SCALE,
+            }
+
+        all_mats = set(list(inb_map.keys()) + list(shp_map.keys()))
+
+        # ── Batch lookup product names (no N+1) ──
+        prod_map = {}
+        if all_mats:
+            placeholders = ",".join("?" * len(all_mats))
+            prod_rows = con.execute(
+                f"SELECT material, product_name, product_group FROM dim_product WHERE substr(material,1,18) IN ({placeholders})",
+                list(all_mats),
+            ).fetchall()
+            for r in prod_rows:
+                key = r["material"][:18]
+                prod_map[key] = {"name": r["product_name"], "group": r["product_group"]}
+
+        # ── Build union result ──
+        union = []
+        for mat in all_mats:
+            i = inb_map.get(mat, {"cnt": 0, "qty": 0, "amt": 0})
+            s = shp_map.get(mat, {"cnt": 0, "qty": 0, "amt": 0})
+            p = prod_map.get(mat)
+            union.append({
+                "material": mat,
+                "name": p["name"] if p else mat,
+                "product_group": p["group"] if p else "UNKNOWN",
+                "production": i["qty"],
+                "shipment": s["qty"],
+                "shipment_amount": s["amt"],
+                "inventory": 0,
+                "count": i["cnt"] + s["cnt"],
+                "_sort_key": max(i["qty"], s["qty"]),
+            })
+
+        # Sort by largest value (inbound or shipment, whichever is bigger)
+        union.sort(key=lambda x: x["_sort_key"], reverse=True)
+
+        # Remove sort key and take Top N
+        for item in union:
+            del item["_sort_key"]
+        result = union[:limit]
+
+        return {
+            "items": result,
+            "date": inb_as_of,
+            "shipment_date": shp_as_of,
+            "metric": metric,
+            "total_materials": len(all_mats),
+        }
+    finally:
+        con.close()
+
+
+def api_events(params: dict) -> dict:
+    """실시간 이벤트 로그 (최근 N건) — 입고/출하 합집합, 시간 역순."""
+    con = get_db()
+    try:
+        limit = min(int(_p(params, "limit", "50") or "50"), MAX_LIMIT)
+        half = max(limit // 2, 1)
+
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        _add_user_filters(fb_shp, params, is_shipment=True)
+
+        inb_rows = con.execute(
+            f"""
+            SELECT 'INB' as src, business_date, business_time, material,
+                   qty_i, warehouse, customer_key, business_us
+            FROM inbound_current
+            WHERE {fb_inb.where}
+            ORDER BY business_us DESC LIMIT :lim
+            """,
+            {**fb_inb.params, "lim": half},
+        ).fetchall()
+
+        shp_rows = con.execute(
+            f"""
+            SELECT 'SHP' as src, business_date, business_time, material,
+                   qty_i, COALESCE(k.kzwi3 * {SCALE}, amount_i) AS amount_i,
+                   COALESCE(k.kunag, customer_key) AS customer_key,
+                   COALESCE(k.soname, '') AS soname,
+                   business_us
+            FROM shipment_current
+            {_SHIP_AMT_JOIN}
+            WHERE {fb_shp.where} AND business_date <= :today
+            ORDER BY business_us DESC LIMIT :lim
+            """,
+            {**fb_shp.params, "today": today_str(), "lim": half},
+        ).fetchall()
+
+        events = []
+        for r in inb_rows:
+            qty_ea = float(r["qty_i"]) / SCALE
+            mat_short = (r["material"] or "?")[:14]
+            tm = r["business_time"] or "000000"
+            time_str = f"{tm[:2]}:{tm[2:4]}:{tm[4:6]}"
+            events.append({
+                "time": time_str,
+                "date": r["business_date"],
+                "type": "입고등록",
+                "detail": f"{mat_short} {qty_ea:,.0f} EA 입고",
+                "warehouse": r["warehouse"],
+                "us": r["business_us"],
+            })
+        for r in shp_rows:
+            qty_ea = float(r["qty_i"]) / SCALE
+            mat_short = (r["material"] or "?")[:14]
+            tm = r["business_time"] or "000000"
+            time_str = f"{tm[:2]}:{tm[2:4]}:{tm[4:6]}"
+            amt = float(r["amount_i"]) / SCALE if r["amount_i"] else 0
+            cust_display = r["soname"] or r["customer_key"] or ""
+            events.append({
+                "time": time_str,
+                "date": r["business_date"],
+                "type": "출하",
+                "detail": f"{mat_short} {qty_ea:,.0f} EA 출하 (${amt:,.0f})",
+                "customer": cust_display,
+                "warehouse": None,
+                "us": r["business_us"],
+            })
+
+        events.sort(key=lambda x: x["us"], reverse=True)
+        for e in events:
+            del e["us"]
+        return {"events": events[:limit], "timestamp": datetime.now().isoformat()}
+    finally:
+        con.close()
+
+
+def api_inbound_progress(params: dict) -> dict:
+    """실시간 입고 진행 — 실제 상태 데이터 없음 → simulated=true."""
+    con = get_db()
+    try:
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+
+        rows = con.execute(
+            f"""
+            SELECT business_date, business_time, material, qty_i, warehouse, plant
+            FROM inbound_current
+            WHERE {fb_inb.where}
+            ORDER BY business_us DESC LIMIT 15
+            """,
+            fb_inb.params,
+        ).fetchall()
+
+        line_map = {"P1S1": "S1 Line", "P1S2": "S2 Line", "P1S3": "S3 Line", "P1M1": "M1 Line"}
+        progress = []
+        for r in rows:
+            mat18 = (r["material"] or "?")[:18]
+            wh_name = WH_MAP.get(r["warehouse"], r["warehouse"] or "-")
+            line_name = line_map.get(r["plant"], f"Line {r['plant'][-2:]}" if r["plant"] else "Line")
+            prod = con.execute(
+                "SELECT product_name FROM dim_product WHERE substr(material,1,18)=? LIMIT 1",
+                [mat18],
+            ).fetchone()
+            item_name = prod["product_name"] if prod else mat18[:10]
+            tm = r["business_time"] or "000000"
+            progress.append({
+                "line": line_name,
+                "material": mat18,
+                "item_name": item_name,
+                "customer": "생산입고",
+                "qty": float(r["qty_i"]) / SCALE,
+                "warehouse": wh_name,
+                "stage": "입고완료",
+                "is_new": False,
+                "time": tm,
+            })
+
+        return {
+            "progress": progress,
+            "timestamp": datetime.now().isoformat(),
+            "simulated": True,
+            "note": "실제 입고 진행 상태 데이터 없음. 최근 입고 이벤트를 표시합니다.",
+        }
+    finally:
+        con.close()
+
+
+def api_alerts(params: dict) -> dict:
+    """알림 (등급별) — int(YYYYMMDD) 차감 제거, datetime 사용."""
+    con = get_db()
+    try:
+        alerts = []
+        ym = current_month()
+
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        shp_plan_raw, shp_tg_avail = _plan_target(con, "shipment", "EA", ym)
+        shp_actual_row = con.execute(
+            f"""SELECT COALESCE(SUM(qty_i),0) qty FROM shipment_current
+                WHERE {fb_shp.where} AND substr(business_date,1,6) = :ym""",
+            {**fb_shp.params, "ym": ym},
+        ).fetchone()
+        if shp_tg_avail and shp_actual_row["qty"]:
+            plan_val = shp_plan_raw / SCALE
+            actual_val = float(shp_actual_row["qty"]) / SCALE
+            ach = actual_val / plan_val * 100 if plan_val else 0
+            if ach < 50:
+                alerts.append({"level": "danger", "msg": f"출하 달성률 {ach:.1f}% - 목표 대비 현저히 저조"})
+            elif ach < 80:
+                alerts.append({"level": "warning", "msg": f"출하 달성률 {ach:.1f}% - 주의 필요"})
+            else:
+                alerts.append({"level": "success", "msg": f"출하 달성률 {ach:.1f}% - 정상"})
+
+        # 입고 목표
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        inb_plan_raw, inb_tg_avail = _plan_target(con, "inbound", "EA", ym)
+        inb_actual_row = con.execute(
+            f"""SELECT COALESCE(SUM(qty_i),0) qty FROM inbound_current
+                WHERE {fb_inb.where} AND substr(business_date,1,6) = :ym""",
+            {**fb_inb.params, "ym": ym},
+        ).fetchone()
+        if inb_tg_avail and inb_actual_row["qty"]:
+            plan_val = inb_plan_raw / SCALE
+            actual_val = float(inb_actual_row["qty"]) / SCALE
+            ach = actual_val / plan_val * 100 if plan_val else 0
+            if ach > 200:
+                alerts.append({"level": "warning", "msg": f"생산(입고) 목표 대비 {ach:.0f}% - 목표 초과"})
+            else:
+                alerts.append({"level": "info", "msg": f"생산(입고) 달성률 {ach:.1f}%"})
+
+        # 재고 데이터 없음
+        inv_cnt = con.execute("SELECT COUNT(*) FROM inventory_current WHERE deleted=0").fetchone()[0]
+        if inv_cnt == 0:
+            alerts.append({"level": "info", "msg": "재고 데이터 미연동 (inventory_current 0건)"})
+
+        # 출하 데이터 최신 여부 (datetime 비교, not int subtraction)
+        dates = get_latest_dates(con)
+        today = today_str()
+        if dates["shipment"]:
+            today_dt = parse_yyyymmdd(today)
+            shp_dt = parse_yyyymmdd(dates["shipment"])
+            if today_dt and shp_dt:
+                gap = (today_dt - shp_dt).days
+                if gap > 1:
+                    alerts.append({"level": "warning", "msg": f"출하 데이터 최신 아님 (마지막: {dates['shipment']})"})
+
+        if not alerts:
+            alerts.append({"level": "success", "msg": "정상 운영 중"})
+
+        return {"alerts": alerts}
+    finally:
+        con.close()
+
+
+def api_filters(params: dict) -> dict:
+    """필터 옵션 (거래선/창고/제품군/품목)."""
+    con = get_db()
+    try:
+        # 거래선 목록: ZTSDJK0120의 KUNAG/SONAME 우선, 미매칭은 기존 customer_key 사용
+        customers = [
+            {"key": r["cust_key"], "name": r["cust_name"]}
+            for r in con.execute(
+                f"""
+                SELECT COALESCE(k.kunag, s.customer_key) AS cust_key,
+                       COALESCE(NULLIF(k.soname, ''),
+                               CASE
+                                   WHEN s.customer_key LIKE 'C%' AND s.customer_key LIKE '%-%' THEN
+                                       CASE s.customer_key
+                                           WHEN 'C100-DS' THEN '삼성전자 DS'
+                                           WHEN 'C320-00' THEN '삼성전자 MX'
+                                           WHEN 'C114-00' THEN '삼성SDI'
+                                           WHEN 'C450-00' THEN '삼성전기'
+                                           WHEN 'C5D1-00' THEN '삼성디스플레이'
+                                           WHEN 'C6G0-00' THEN '삼성SDS'
+                                           WHEN 'C6S1-00' THEN '삼성바이오로직스'
+                                           WHEN 'GE01-01' THEN '해외법인'
+                                           ELSE '삼성 (' || s.customer_key || ')'
+                                       END
+                                   WHEN s.customer_key LIKE '000%' THEN '외부거래선 (' || s.customer_key || ')'
+                                   ELSE s.customer_key
+                               END) AS cust_name
+                FROM shipment_current s
+                {_SHIP_AMT_JOIN_S}
+                WHERE s.deleted = 0 AND s.document_no LIKE '6%'
+                GROUP BY cust_key, cust_name
+                ORDER BY cust_name
+                LIMIT 200
+                """
+            ).fetchall()
+        ]
+        warehouses = [
+            {"key": r["warehouse"], "name": WH_MAP.get(r["warehouse"], r["warehouse"])}
+            for r in con.execute(
+                f"SELECT DISTINCT warehouse FROM inbound_current WHERE warehouse IS NOT NULL "
+                f"AND deleted=0 AND plant='P1M1' AND c_id IN ('CO','GO') "
+                f"AND warehouse NOT IN (?,?,?,?) AND i_type != '34' ORDER BY warehouse",
+                EXCLUDED_WAREHOUSES,
+            ).fetchall()
+        ]
+        product_groups = [
+            {"key": r["product_group"], "name": r["product_group"]}
+            for r in con.execute(
+                "SELECT DISTINCT product_group FROM dim_product "
+                "WHERE product_group IS NOT NULL ORDER BY product_group"
+            ).fetchall()
+        ]
+        items = [
+            {"key": r["material"], "name": r["product_name"] or r["material"]}
+            for r in con.execute(
+                "SELECT material, product_name FROM dim_product "
+                "WHERE product_group IS NOT NULL ORDER BY material LIMIT 50"
+            ).fetchall()
+        ]
+        return {
+            "customers": customers,
+            "warehouses": warehouses,
+            "product_groups": product_groups,
+            "items": items,
+        }
+    finally:
+        con.close()
+
+
+def api_daily_trend(params: dict) -> dict:
+    """일별 추이 (월간) — 입고/출하 동일 월 필터."""
+    con = get_db()
+    try:
+        ym = _p(params, "month", current_month())
+        if ym and (len(ym) != 6 or not ym.isdigit()):
+            ym = current_month()
+        _today = today_str()
+
+        fb_inb = FilterBuilder()
+        _inbound_base_filter(fb_inb)
+        _add_user_filters(fb_inb, params)
+        fb_shp = FilterBuilder()
+        _shipment_base_filter(fb_shp)
+        _add_user_filters(fb_shp, params, is_shipment=True)
+
+        inb = con.execute(
+            f"""SELECT business_date, SUM(qty_i) qty FROM inbound_current
+                WHERE {fb_inb.where} AND substr(business_date,1,6) = :ym
+                GROUP BY business_date ORDER BY business_date""",
+            {**fb_inb.params, "ym": ym},
+        ).fetchall()
+        shp = con.execute(
+            f"""SELECT business_date, SUM(qty_i) qty,
+                    SUM(k.kzwi3 * {SCALE}) amt
+                FROM shipment_current
+                {_SHIP_AMT_JOIN}
+                WHERE {fb_shp.where} AND substr(business_date,1,6) = :ym AND business_date <= :today
+                GROUP BY business_date ORDER BY business_date""",
+            {**fb_shp.params, "ym": ym, "today": _today},
+        ).fetchall()
+
+        inb_map = {r["business_date"]: float(r["qty"]) / SCALE for r in inb}
+        shp_map = {r["business_date"]: (float(r["qty"]) / SCALE, float(r["amt"]) / SCALE) for r in shp}
+        all_dates = sorted(set(list(inb_map.keys()) + list(shp_map.keys())))
+        result = []
+        for d in all_dates:
+            result.append({
+                "date": d,
+                "production": round(inb_map.get(d, 0), 1),
+                "shipment": round(shp_map.get(d, (0, 0))[0], 1),
+                "shipment_amount": round(shp_map.get(d, (0, 0))[1], 1),
+            })
+        return {"daily": result, "month": ym}
+    finally:
+        con.close()
+
+
+# ── Router ────────────────────────────────────────────────
+ROUTES = {
+    "/api/kpi": api_kpi,
+    "/api/hourly": api_hourly,
+    "/api/customers": api_customers,
+    "/api/items": api_items,
+    "/api/events": api_events,
+    "/api/inbound-progress": api_inbound_progress,
+    "/api/alerts": api_alerts,
+    "/api/filters": api_filters,
+    "/api/daily-trend": api_daily_trend,
+    # ── Dynamic Target Rule Manager (GET) ──
+    "/api/targets": lambda params: target_manager.list_targets(
+        period_ym=params.get("period_ym", [None])[0],
+        direction=params.get("direction", [None])[0],
+    ),
+    "/api/targets/get": lambda params: target_manager.get_target(
+        int(params.get("target_id", [0])[0])
+    ),
+    "/api/targets/meta": lambda params: target_manager.get_field_metadata(),
+    "/api/targets/preview": lambda params: target_manager.preview_target({
+        "period_ym": params.get("period_ym", [""])[0],
+        "direction": params.get("direction", [""])[0],
+        "metric": params.get("metric", [""])[0],
+        "filters": json.loads(params.get("filters", ["[]"])[0]),
+    }),
+    "/api/targets/resolve": lambda params: target_manager.resolve_target_api({
+        "period_ym": params.get("period_ym", [""])[0],
+        "direction": params.get("direction", [""])[0],
+        "metric": params.get("metric", ["EA"])[0],
+    }),
+    # ── Focus Item Manager (GET) ──
+    "/api/focus": lambda params: focus_manager.handle_get({
+        "action": params.get("action", ["list"])[0],
+        "metric": params.get("metric", ["EA"])[0],
+    }),
+}
+
+MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
+
+
+def json_response(handler, data: dict, status: int = 200):
+    """공통 JSON response helper — Content-Length 포함."""
+    body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def error_response(handler, msg: str, status: int = 400):
+    json_response(handler, {"error": msg}, status)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query)
+
+        if path in ROUTES:
+            try:
+                # Validate params
+                clean, err = validate_params(params)
+                if err:
+                    error_response(self, err, 400)
+                    return
+                params = clean
+
+                t_start = time.time()
+                ckey = _cache_key(path, params)
+                body = cache_get(ckey)
+                cache_hit = body is not None
+                if body is None:
+                    data = ROUTES[path](params)
+                    body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+                    cache_set(ckey, body)
+                t_end = time.time()
+                print(f"[API] {path} cache_hit={cache_hit} {(t_end-t_start)*1000:.1f}ms", flush=True)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                error_response(self, str(e), 500)
+            return
+
+        # Static files — safe path traversal prevention
+        if path == "/" or path == "":
+            path = "/index.html"
+        safe_path = (STATIC_DIR / path.lstrip("/")).resolve()
+        try:
+            safe_path.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            self.send_error(403)
+            return
+        if safe_path.is_file():
+            ext = safe_path.suffix
+            mime = MIME.get(ext, "application/octet-stream")
+            body = safe_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_POST(self):
+        """Handle POST requests for Dynamic Target Rule Manager."""
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # Read body
+        content_length = int(self.headers.get("Content-Length", 0))
+        body_raw = self.rfile.read(content_length) if content_length > 0 else b""
+        try:
+            body = json.loads(body_raw) if body_raw else {}
+        except json.JSONDecodeError:
+            error_response(self, "Invalid JSON body", 400)
+            return
+
+        try:
+            if path == "/api/targets/create":
+                result = target_manager.create_target(body)
+            elif path == "/api/targets/update":
+                tid = int(body.get("target_id", 0))
+                result = target_manager.update_target(tid, body)
+            elif path == "/api/targets/delete":
+                tid = int(body.get("target_id", 0))
+                result = target_manager.delete_target(tid)
+            elif path == "/api/targets/copy":
+                tid = int(body.get("target_id", 0))
+                result = target_manager.copy_target(tid, body)
+            elif path == "/api/targets/copy-month":
+                result = target_manager.copy_month_targets(
+                    body.get("from_ym", ""),
+                    body.get("to_ym", ""),
+                    body.get("direction", None),
+                )
+            elif path == "/api/targets/preview":
+                result = target_manager.preview_target(body)
+            # ── Focus Item Manager (POST) ──
+            elif path == "/api/focus/create":
+                body["action"] = "create"
+                result = focus_manager.handle_post(body)
+            elif path == "/api/focus/batch_create":
+                body["action"] = "batch_create"
+                result = focus_manager.handle_post(body)
+            elif path == "/api/focus/delete":
+                body["action"] = "delete"
+                result = focus_manager.handle_post(body)
+            elif path == "/api/focus/delete_batch":
+                body["action"] = "delete_batch"
+                result = focus_manager.handle_post(body)
+            elif path == "/api/focus/update":
+                body["action"] = "update"
+                result = focus_manager.handle_post(body)
+            else:
+                error_response(self, f"Unknown POST endpoint: {path}", 404)
+                return
+
+            status = 200
+            if isinstance(result, dict) and "error" in result:
+                status = 400
+            json_response(self, result, status)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_response(self, str(e), 500)
+
+
+def main():
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    con = get_db()
+    get_latest_dates(con)
+    con.close()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True
+    print(f"[SCM Dashboard] http://localhost:{PORT}")
+    print(f"[DB] {DB_PATH}")
+    print(f"[Static] {STATIC_DIR}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[Shutdown]")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

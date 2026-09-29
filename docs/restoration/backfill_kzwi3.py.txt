@@ -1,0 +1,46 @@
+"""One-time collect for shipment_amount_dep (ZTSDJK0120) backfill."""
+import sys, os, time, logging
+
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+os.chdir(r'H:\python_pjt\SCMRealtimeDB')
+sys.path.insert(0, r'H:\python_pjt\SCMRealtimeDB')
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(name)s %(levelname)s %(message)s')
+
+from scm_db.settings import Settings
+from scm_db.database import Database
+from scm_db.engine import Engine
+
+ROOT = r'H:\python_pjt\SCMRealtimeDB'
+s = Settings(ROOT)
+db = Database(s.db_path, ROOT)
+engine = Engine(s, db)
+
+d = s.source('shipment_amount_dep')
+print(f'Source: id={d["id"]}, table={d["table"]}, index={d["index"]}, enabled={d.get("enabled")}')
+
+# Backfill from September 1
+from_epoch = int(time.mktime(time.strptime('2026-09-01', '%Y-%m-%d')))
+print(f'Collecting from {from_epoch} (2026-09-01)...')
+
+try:
+    result = engine.collect(d, from_epoch=from_epoch)
+    print(f'Result: {result}')
+except Exception as exc:
+    import traceback
+    traceback.print_exc()
+
+# Check DB
+import sqlite3
+con = sqlite3.connect(f"file:{db.path}?mode=ro", uri=True)
+con.row_factory = sqlite3.Row
+count = con.execute("SELECT COUNT(*) FROM shipment_amount_current").fetchone()[0]
+print(f'shipment_amount_current rows: {count}')
+if count > 0:
+    sample = con.execute("SELECT * FROM shipment_amount_current LIMIT 3").fetchall()
+    for row in sample:
+        print(f'  key={row["record_key"]}, doc={row["document_no"]}, mat={row["material"]}, '
+              f'amount_i={row["amount_i"]}, date={row["business_date"]}')
+con.close()

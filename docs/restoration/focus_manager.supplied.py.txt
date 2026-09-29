@@ -1,0 +1,458 @@
+"""
+Focus Item Manager — 집중관리 아이템 관리 모듈
+
+기능:
+  - 특정 아이템 / 거래선 / 특정 거래선의 아이템 등록
+  - 개별 / 일괄 등록, 삭제
+  - 각 장표별 KPI와 동일한 집계 로직으로 실적 계산
+  - 목표 대비 달성률 표시 (plan_monthly 기반)
+
+DB 테이블: focus_item
+  - focus_id (PK, AUTOINCREMENT)
+  - focus_type: 'item' | 'customer' | 'customer_item'
+  - item_code (nullable)
+  - customer_code (nullable)
+  - label (표시명)
+  - enabled (0/1)
+  - created_at, updated_at
+"""
+
+import sqlite3
+import json
+import os
+from datetime import datetime
+from collections import OrderedDict
+
+# ── DB 경로 ────────────────────────────────────────────────
+LIVE_DB = os.path.join(
+    os.environ.get("LOCALAPPDATA", ""),
+    "SCMRealtimeDB", "live", "scm_live.sqlite",
+)
+if not os.path.exists(LIVE_DB):
+    LIVE_DB = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "SCMRealtimeDB", "scm_live.sqlite",
+    )
+
+# ── Schema ─────────────────────────────────────────────────
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS focus_item (
+    focus_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    focus_type    TEXT    NOT NULL DEFAULT 'item',   -- item | customer | customer_item
+    item_code     TEXT    NULL,
+    customer_code TEXT    NULL,
+    label         TEXT    NOT NULL DEFAULT '',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+    updated_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+"""
+
+def _get_db():
+    con = sqlite3.connect(LIVE_DB)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute(SCHEMA)
+    return con
+
+# ── CRUD ───────────────────────────────────────────────────
+def list_focus():
+    """등록된 집중관리 아이템 전체 목록 반환"""
+    con = _get_db()
+    try:
+        rows = con.execute(
+            "SELECT * FROM focus_item WHERE enabled=1 ORDER BY sort_order, focus_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+def list_all_focus():
+    """활성/비활성 포함 전체 목록"""
+    con = _get_db()
+    try:
+        rows = con.execute(
+            "SELECT * FROM focus_item ORDER BY enabled DESC, sort_order, focus_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+def create_focus(focus_type, item_code=None, customer_code=None, label=None, enabled=1):
+    """집중관리 아이템 등록"""
+    if focus_type not in ("item", "customer", "customer_item"):
+        raise ValueError(f"focus_type must be item/customer/customer_item, got {focus_type}")
+    if focus_type in ("item", "customer_item") and not item_code:
+        raise ValueError("item_code is required for item/customer_item type")
+    if focus_type in ("customer", "customer_item") and not customer_code:
+        raise ValueError("customer_code is required for customer/customer_item type")
+
+    # label 자동 생성
+    if not label:
+        if focus_type == "item":
+            label = f"ITEM {item_code}"
+        elif focus_type == "customer":
+            label = f"거래선 {customer_code}"
+        else:
+            label = f"{customer_code} / {item_code}"
+
+    con = _get_db()
+    try:
+        # 중복 체크
+        existing = con.execute(
+            "SELECT focus_id FROM focus_item WHERE focus_type=? AND item_code IS ? AND customer_code IS ?",
+            [focus_type, item_code, customer_code],
+        ).fetchone()
+        if existing:
+            return {"focus_id": existing["focus_id"], "ok": False, "reason": "duplicate"}
+
+        cur = con.execute(
+            "INSERT INTO focus_item (focus_type, item_code, customer_code, label, enabled) VALUES (?,?,?,?,?)",
+            [focus_type, item_code, customer_code, label, enabled],
+        )
+        con.commit()
+        return {"focus_id": cur.lastrowid, "ok": True}
+    finally:
+        con.close()
+
+def batch_create(items):
+    """일괄 등록
+    items: [{focus_type, item_code, customer_code, label}, ...]
+    """
+    results = []
+    for it in items:
+        r = create_focus(
+            it.get("focus_type", "item"),
+            it.get("item_code"),
+            it.get("customer_code"),
+            it.get("label"),
+            it.get("enabled", 1),
+        )
+        results.append(r)
+    return {"results": results, "count": len(results)}
+
+def delete_focus(focus_id):
+    """삭제"""
+    con = _get_db()
+    try:
+        cur = con.execute("DELETE FROM focus_item WHERE focus_id=?", [focus_id])
+        con.commit()
+        return {"focus_id": focus_id, "ok": True, "deleted": cur.rowcount > 0}
+    finally:
+        con.close()
+
+def delete_batch(focus_ids):
+    """일괄 삭제"""
+    con = _get_db()
+    try:
+        deleted = 0
+        for fid in focus_ids:
+            cur = con.execute("DELETE FROM focus_item WHERE focus_id=?", [fid])
+            deleted += cur.rowcount
+        con.commit()
+        return {"ok": True, "deleted": deleted, "count": len(focus_ids)}
+    finally:
+        con.close()
+
+def update_focus(focus_id, label=None, enabled=None, sort_order=None):
+    """수정 (label, enabled, sort_order)"""
+    con = _get_db()
+    try:
+        fields = []
+        params = []
+        if label is not None:
+            fields.append("label=?")
+            params.append(label)
+        if enabled is not None:
+            fields.append("enabled=?")
+            params.append(enabled)
+        if sort_order is not None:
+            fields.append("sort_order=?")
+            params.append(sort_order)
+        if not fields:
+            return {"focus_id": focus_id, "ok": False, "reason": "no fields to update"}
+        fields.append("updated_at=datetime('now','localtime')")
+        params.append(focus_id)
+        con.execute(f"UPDATE focus_item SET {', '.join(fields)} WHERE focus_id=?", params)
+        con.commit()
+        return {"focus_id": focus_id, "ok": True}
+    finally:
+        con.close()
+
+# ── KPI 계산 ───────────────────────────────────────────────
+def _build_where(focus, direction):
+    """focus_item에서 WHERE clause params dict 생성 (기존 _add_user_filters 호환)"""
+    params = {}
+    ft = focus["focus_type"]
+    if ft in ("customer", "customer_item"):
+        params["customer"] = focus["customer_code"]
+    if ft in ("item", "customer_item"):
+        params["item"] = focus["item_code"]
+    return params
+
+def compute_focus_kpi(focus, con, metric="EA"):
+    """개별 focus_item의 KPI 계산 (inbound + shipment)
+    기존 server.py의 _inbound_base_filter / _shipment_base_filter와 동일한 로직 적용.
+    """
+    SCALE = 1_000_000
+    EXCLUDED_WAREHOUSES = ["63D0", "63J0", "63P0", "13H0"]
+    _EX_WH = {f"ex_wh{i+1}": w for i, w in enumerate(EXCLUDED_WAREHOUSES)}
+
+    inb_params = _build_where(focus, "inbound")
+    shp_params = _build_where(focus, "shipment")
+
+    # ── Inbound ──
+    inb_where = ["deleted=0", "plant='P1M1'", "c_id IN ('CO','GO')",
+                 "warehouse NOT IN (:ex_wh1,:ex_wh2,:ex_wh3,:ex_wh4)", "i_type != '34'"]
+    inb_bindings = dict(_EX_WH)
+
+    if "customer" in inb_params:
+        inb_where.append("customer_key = :f_cust")
+        inb_bindings["f_cust"] = inb_params["customer"]
+    if "item" in inb_params:
+        inb_where.append("substr(material,1,18) = :f_item")
+        inb_bindings["f_item"] = inb_params["item"]
+
+    inb_where_sql = " AND ".join(inb_where)
+
+    # 최신 입고일
+    inb_date_row = con.execute(
+        f"SELECT MAX(business_date) d FROM inbound_current WHERE {inb_where_sql}", inb_bindings
+    ).fetchone()
+    inb_as_of = inb_date_row["d"] if inb_date_row and inb_date_row["d"] else None
+
+    inb_mtd = 0.0
+    inb_today = 0.0
+    inb_count = 0
+    if inb_as_of:
+        inb_ym = inb_as_of[:6]
+        inb_mstart = inb_ym + "01"
+        if metric == "BOX":
+            inb_mtd_row = con.execute(
+                f"SELECT COUNT(DISTINCT CASE WHEN business_date>=:ms AND business_date<=:ao THEN box_no END) v, "
+                f"COUNT(DISTINCT CASE WHEN business_date=:ao THEN box_no END) tv, "
+                f"SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM inbound_current WHERE {inb_where_sql} "
+                f"AND (business_date>=:ms AND business_date<=:ao OR business_date=:ao)",
+                {**inb_bindings, "ms": inb_mstart, "ao": inb_as_of},
+            ).fetchone()
+            inb_mtd = inb_mtd_row["v"] or 0
+            inb_today = inb_mtd_row["tv"] or 0
+            inb_count = inb_mtd_row["c"] or 0
+        elif metric == "USD":
+            # 입고 USD 미집집 (amount_i=0)
+            inb_mtd = 0.0
+            inb_today = 0.0
+            cnt_row = con.execute(
+                f"SELECT SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM inbound_current WHERE {inb_where_sql} "
+                f"AND business_date>=:ms AND business_date<=:ao",
+                {**inb_bindings, "ms": inb_mstart, "ao": inb_as_of},
+            ).fetchone()
+            inb_count = cnt_row["c"] or 0
+        elif metric in ("EQ_DRAM", "EQ_FLASH"):
+            unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH"
+            eq_join = (f" LEFT JOIN (SELECT material AS conv_mat, eq_per_unit "
+                       f"FROM dim_conversion WHERE unit='{unit}') "
+                       f"ON substr(inbound_current.material,1,18) = conv_mat")
+            val_expr = "qty_i * CAST(eq_per_unit AS REAL)"
+            row = con.execute(
+                f"SELECT COALESCE(SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN {val_expr} ELSE 0 END),0) v, "
+                f"COALESCE(SUM(CASE WHEN business_date=:ao THEN {val_expr} ELSE 0 END),0) tv, "
+                f"SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM inbound_current {eq_join} WHERE {inb_where_sql} "
+                f"AND business_date>=:ms AND business_date<=:ao",
+                {**inb_bindings, "ms": inb_mstart, "ao": inb_as_of},
+            ).fetchone()
+            inb_mtd = (row["v"] or 0) / SCALE
+            inb_today = (row["tv"] or 0) / SCALE
+            inb_count = row["c"] or 0
+        else:  # EA
+            row = con.execute(
+                f"SELECT COALESCE(SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN qty_i ELSE 0 END),0) v, "
+                f"COALESCE(SUM(CASE WHEN business_date=:ao THEN qty_i ELSE 0 END),0) tv, "
+                f"SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM inbound_current WHERE {inb_where_sql} "
+                f"AND business_date>=:ms AND business_date<=:ao",
+                {**inb_bindings, "ms": inb_mstart, "ao": inb_as_of},
+            ).fetchone()
+            inb_mtd = (row["v"] or 0) / SCALE
+            inb_today = (row["tv"] or 0) / SCALE
+            inb_count = row["c"] or 0
+
+    # ── Shipment ──
+    shp_where = ["deleted=0", "plant='P1M1'", "document_no LIKE '6%'",
+                 "warehouse NOT IN (:ex_wh1,:ex_wh2,:ex_wh3,:ex_wh4)"]
+    shp_bindings = dict(_EX_WH)
+
+    _SHIP_AMT_JOIN = (
+        "LEFT JOIN shipment_amount_kzwi3 k "
+        "ON json_extract(s.record_key, '$[0]') = k.vbeln "
+        "AND json_extract(s.record_key, '$[1]') = k.posnr"
+    )
+
+    if "customer" in shp_params:
+        shp_where.append("COALESCE(k.kunag, s.customer_key) = :f_cust")
+        shp_bindings["f_cust"] = shp_params["customer"]
+    if "item" in shp_params:
+        shp_where.append("substr(s.material,1,18) = :f_item")
+        shp_bindings["f_item"] = shp_params["item"]
+
+    shp_where_sql = " AND ".join(shp_where)
+
+    shp_date_row = con.execute(
+        f"SELECT MAX(business_date) d FROM shipment_current s {_SHIP_AMT_JOIN} WHERE {shp_where_sql}",
+        shp_bindings,
+    ).fetchone()
+    shp_as_of = shp_date_row["d"] if shp_date_row and shp_date_row["d"] else None
+
+    shp_mtd = 0.0
+    shp_today = 0.0
+    shp_count = 0
+    if shp_as_of:
+        shp_ym = shp_as_of[:6]
+        shp_mstart = shp_ym + "01"
+        if metric == "BOX":
+            # BOX uses shipment_box_current
+            shp_box_where = ["deleted=0", "plant='P1M1'", "document_no LIKE '6%'",
+                             "warehouse NOT IN (:ex_wh1,:ex_wh2,:ex_wh3,:ex_wh4)"]
+            shp_box_bindings = dict(_EX_WH)
+            if "customer" in shp_params:
+                shp_box_where.append("customer_key = :f_cust")
+                shp_box_bindings["f_cust"] = shp_params["customer"]
+            if "item" in shp_params:
+                shp_box_where.append("substr(material,1,18) = :f_item")
+                shp_box_bindings["f_item"] = shp_params["item"]
+            shp_box_sql = " AND ".join(shp_box_where)
+            row = con.execute(
+                f"SELECT COALESCE(SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN box_no ELSE 0 END),0) v, "
+                f"COALESCE(SUM(CASE WHEN business_date=:ao THEN box_no ELSE 0 END),0) tv, "
+                f"SUM(CASE WHEN business_date>=:ms AND business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM shipment_box_current WHERE {shp_box_sql} "
+                f"AND business_date>=:ms AND business_date<=:ao",
+                {**shp_box_bindings, "ms": shp_mstart, "ao": shp_as_of},
+            ).fetchone()
+            shp_mtd = row["v"] or 0
+            shp_today = row["tv"] or 0
+            shp_count = row["c"] or 0
+        elif metric == "USD":
+            val_expr = f"k.kzwi3 * {SCALE}"
+            row = con.execute(
+                f"SELECT COALESCE(SUM(CASE WHEN s.business_date>=:ms AND s.business_date<=:ao THEN {val_expr} ELSE 0 END),0) v, "
+                f"COALESCE(SUM(CASE WHEN s.business_date=:ao THEN {val_expr} ELSE 0 END),0) tv, "
+                f"SUM(CASE WHEN s.business_date>=:ms AND s.business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM shipment_current s {_SHIP_AMT_JOIN} WHERE {shp_where_sql} "
+                f"AND s.business_date>=:ms AND s.business_date<=:ao",
+                {**shp_bindings, "ms": shp_mstart, "ao": shp_as_of},
+            ).fetchone()
+            shp_mtd = (row["v"] or 0) / SCALE
+            shp_today = (row["tv"] or 0) / SCALE
+            shp_count = row["c"] or 0
+        elif metric in ("EQ_DRAM", "EQ_FLASH"):
+            unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH"
+            eq_join = (f" LEFT JOIN (SELECT material AS conv_mat, eq_per_unit "
+                       f"FROM dim_conversion WHERE unit='{unit}') "
+                       f"ON substr(s.material,1,18) = conv_mat")
+            val_expr = "s.qty_i * CAST(eq_per_unit AS REAL)"
+            row = con.execute(
+                f"SELECT COALESCE(SUM(CASE WHEN s.business_date>=:ms AND s.business_date<=:ao THEN {val_expr} ELSE 0 END),0) v, "
+                f"COALESCE(SUM(CASE WHEN s.business_date=:ao THEN {val_expr} ELSE 0 END),0) tv, "
+                f"SUM(CASE WHEN s.business_date>=:ms AND s.business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM shipment_current s {eq_join} {_SHIP_AMT_JOIN} WHERE {shp_where_sql} "
+                f"AND s.business_date>=:ms AND s.business_date<=:ao",
+                {**shp_bindings, "ms": shp_mstart, "ao": shp_as_of},
+            ).fetchone()
+            shp_mtd = (row["v"] or 0) / SCALE
+            shp_today = (row["tv"] or 0) / SCALE
+            shp_count = row["c"] or 0
+        else:  # EA
+            row = con.execute(
+                f"SELECT COALESCE(SUM(CASE WHEN s.business_date>=:ms AND s.business_date<=:ao THEN s.qty_i ELSE 0 END),0) v, "
+                f"COALESCE(SUM(CASE WHEN s.business_date=:ao THEN s.qty_i ELSE 0 END),0) tv, "
+                f"SUM(CASE WHEN s.business_date>=:ms AND s.business_date<=:ao THEN 1 ELSE 0 END) c "
+                f"FROM shipment_current s {_SHIP_AMT_JOIN} WHERE {shp_where_sql} "
+                f"AND s.business_date>=:ms AND s.business_date<=:ao",
+                {**shp_bindings, "ms": shp_mstart, "ao": shp_as_of},
+            ).fetchone()
+            shp_mtd = (row["v"] or 0) / SCALE
+            shp_today = (row["tv"] or 0) / SCALE
+            shp_count = row["c"] or 0
+
+    return {
+        "focus_id": focus["focus_id"],
+        "label": focus["label"],
+        "focus_type": focus["focus_type"],
+        "item_code": focus["item_code"],
+        "customer_code": focus["customer_code"],
+        "inbound": {
+            "mtd": round(inb_mtd, 2),
+            "today": round(inb_today, 2),
+            "count": inb_count,
+            "date": inb_as_of,
+        },
+        "shipment": {
+            "mtd": round(shp_mtd, 2),
+            "today": round(shp_today, 2),
+            "count": shp_count,
+            "date": shp_as_of,
+        },
+    }
+
+def get_focus_kpi_all(metric="EA"):
+    """모든 활성 focus_item의 KPI 계산"""
+    con = _get_db()
+    try:
+        items = list_focus()
+        results = []
+        for f in items:
+            kpi = compute_focus_kpi(f, con, metric=metric)
+            results.append(kpi)
+        return {"metric": metric, "count": len(results), "items": results}
+    finally:
+        con.close()
+
+# ── HTTP handler ───────────────────────────────────────────
+def handle_get(params: dict) -> dict:
+    """GET /api/focus handler"""
+    action = params.get("action", "list")
+    if action == "list":
+        return {"items": list_focus(), "count": len(list_focus())}
+    elif action == "list_all":
+        return {"items": list_all_focus(), "count": len(list_all_focus())}
+    elif action == "kpi":
+        metric = params.get("metric", "EA")
+        return get_focus_kpi_all(metric=metric)
+    elif action == "meta":
+        return {
+            "focus_types": ["item", "customer", "customer_item"],
+            "fields": ["item_code", "customer_code", "label"],
+            "description": "집중관리 아이템: 특정 아이템/거래선/거래선+아이템 등록 후 각 장표에서 KPI 조회",
+        }
+    return {"error": "unknown action", "action": action}
+
+def handle_post(body: dict) -> dict:
+    """POST /api/focus handler"""
+    action = body.get("action", "")
+    if action == "create":
+        return create_focus(
+            body.get("focus_type", "item"),
+            body.get("item_code"),
+            body.get("customer_code"),
+            body.get("label"),
+            body.get("enabled", 1),
+        )
+    elif action == "batch_create":
+        return batch_create(body.get("items", []))
+    elif action == "delete":
+        return delete_focus(body.get("focus_id"))
+    elif action == "delete_batch":
+        return delete_batch(body.get("focus_ids", []))
+    elif action == "update":
+        return update_focus(
+            body.get("focus_id"),
+            label=body.get("label"),
+            enabled=body.get("enabled"),
+            sort_order=body.get("sort_order"),
+        )
+    return {"error": "unknown action", "action": action}

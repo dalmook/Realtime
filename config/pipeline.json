@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "oracle_schedule": {
+    "timezone": "Asia/Seoul",
+    "at": "09:00",
+    "catch_up": true,
+    "scheduled_attempts_per_day": 1
+  },
+  "splunk_sources": [
+    {
+      "id": "inbound_dep",
+      "title": "DEP 입고",
+      "domain": "inbound",
+      "enabled": true,
+      "mapping_confirmed": true,
+      "connection": "DEP",
+      "index": "powerconnect_dep",
+      "source": "DEP",
+      "event_type": "TREAD_DYN",
+      "table": "ZTLEF52020",
+      "mode": "upsert",
+      "key_fields": [
+        "CHIT",
+        "CHARG"
+      ],
+      "poll_seconds": 60,
+      "overlap_seconds": 300,
+      "max_window_seconds": 86400,
+      "max_events": 50000,
+      "bootstrap_from": "month_start",
+      "scope_filters": {
+        "PLANT": [
+          "P1M1"
+        ],
+        "C_ID": [
+          "CO",
+          "GO"
+        ]
+      },
+      "delete_rule": null,
+      "allow_event_time_version": true,
+      "fields": {
+        "document_no": "CHIT",
+        "box_no": "CHARG",
+        "material": "P_CODE",
+        "quantity": "QTY",
+        "unit": "UNIT",
+        "plant": "PLANT",
+        "warehouse": "LGNUM",
+        "location": "LGORT",
+        "customer_key": "GC_CODE",
+        "business_date": "I_DATE",
+        "business_time": "I_TIME",
+        "modified_date": "AEDAT",
+        "modified_time": "AEZET",
+        "generated_timestamp": "CURRENT_TIMESTAMP"
+      },
+      "notes": [
+        "CHIT+CHARG는 현재 사용자가 선택한 업무키. SAP 정식 PK 확인 권장.",
+        "PC는 원본 유지, 조회 표시 EA. BOX=선택 집합의 DISTINCT CHARG.",
+        "PLANT/C_ID는 최신행 적재 후 범위판정. 원천 단계에 넣지 않아 범위 밖 변경도 반영.",
+        "ACCOUNT는 거래선키로 확인되지 않았으므로 customer_key에 자동 매핑하지 않음.",
+        "I_FLAG/T_FLAG/D_FLAG는 의미가 확인되지 않아 취소조건으로 임의 사용하지 않음."
+      ]
+    },
+    {
+      "id": "inventory_dep",
+      "title": "DEP 재고",
+      "domain": "inventory",
+      "enabled": false,
+      "mapping_confirmed": false,
+      "connection": "DEP",
+      "index": "powerconnect_dep",
+      "source": "DEP",
+      "event_type": "TREAD_DYN",
+      "table": "",
+      "mode": "upsert",
+      "key_fields": [],
+      "poll_seconds": 60,
+      "overlap_seconds": 300,
+      "max_window_seconds": 86400,
+      "max_events": 50000,
+      "bootstrap_from": "month_start",
+      "scope_filters": {},
+      "delete_rule": null,
+      "allow_event_time_version": false,
+      "inventory_semantics_confirmed": false,
+      "fields": {
+        "document_no": null,
+        "box_no": null,
+        "material": null,
+        "quantity": null,
+        "unit": null,
+        "plant": null,
+        "warehouse": null,
+        "location": null,
+        "customer_key": null,
+        "business_date": null,
+        "business_time": null,
+        "modified_date": null,
+        "modified_time": null,
+        "generated_timestamp": null
+      },
+      "notes": [
+        "원천 테이블·고유키·업무시각·삭제 의미 확인 후 등록. 입고 매핑을 복사하지 않음."
+      ]
+    },
+    {
+      "id": "shipment_dep",
+      "title": "DEP 출하",
+      "domain": "shipment",
+      "enabled": true,
+      "mapping_confirmed": true,
+      "connection": "DEP",
+      "index": "powerconnect_dep",
+      "source": "DEP",
+      "event_type": "TREAD_DYN",
+      "table": "VBRP",
+      "mode": "upsert",
+      "key_fields": [
+        "VBELN",
+        "POSNR"
+      ],
+      "poll_seconds": 60,
+      "overlap_seconds": 300,
+      "max_window_seconds": 3600,
+      "max_events": 50000,
+      "bootstrap_from": "month_start",
+      "scope_filters": {
+        "WERKS": [
+          "P1M1"
+        ]
+      },
+      "delete_rule": null,
+      "allow_event_time_version": true,
+      "inventory_semantics_confirmed": true,
+      "fields": {
+        "document_no": "VGBEL",
+        "box_no": null,
+        "material": "MATNR",
+        "quantity": "FKIMG",
+        "amount": "NETWR",
+        "exchange_rate": "KURSK",
+        "unit": {
+          "value": "EA"
+        },
+        "plant": "WERKS",
+        "warehouse": "LGORT",
+        "location": null,
+        "customer_key": "KUNAG_ANA",
+        "business_date": "FKDAT_ANA",
+        "business_time": "ERZET",
+        "modified_date": "ERDAT",
+        "modified_time": "ERZET",
+        "generated_timestamp": "CURRENT_TIMESTAMP"
+      },
+      "notes": [
+        "VBRP=청구 품목 테이블. VBELN+POSNR=청구서+품목 복합키.",
+        "NETWR=청구금액(USD), FKIMG=청구수량, VGBEL=DO번호(6004xxxxx → ZSVLEG52010.DELIVERY 조인).",
+        "FKDAT_ANA=청구일자(business_date), ERDAT+ERZET=생성일시(버전판정), KUNAG_ANA=고객코드.",
+        "KURSK=환율(1.0 또는 1384.30 — 통화쌍에 따라 상이). MEINS=단위(기본 EA).",
+        "박스수는 ZSVLEG52010.DELIVERY=VGBEL 조인으로 별도 집계(COUNT DISTINCT CARTON)."
+      ]
+    },
+    {
+      "id": "shipment_box_dep",
+      "title": "DEP 출하 박스(ZSVLEG52010)",
+      "domain": "shipment_box",
+      "enabled": true,
+      "mapping_confirmed": true,
+      "connection": "DEP",
+      "index": "powerconnect_dep",
+      "source": "DEP",
+      "event_type": "TREAD_DYN",
+      "table": "ZSVLEG52010",
+      "mode": "upsert",
+      "key_fields": [
+        "DELIVERY",
+        "CARTON"
+      ],
+      "poll_seconds": 60,
+      "overlap_seconds": 300,
+      "max_window_seconds": 3600,
+      "max_events": 50000,
+      "bootstrap_from": "month_start",
+      "scope_filters": {
+        "PLANT": [
+          "P1M1"
+        ]
+      },
+      "delete_rule": null,
+      "allow_event_time_version": true,
+      "fields": {
+        "document_no": "DELIVERY",
+        "box_no": "CARTON",
+        "material": {
+          "value": "N/A"
+        },
+        "quantity": "CARTON",
+        "unit": {
+          "value": "BOX"
+        },
+        "plant": "PLANT",
+        "warehouse": "LGNUM",
+        "location": null,
+        "customer_key": null,
+        "business_date": "SD_DATE",
+        "business_time": "SD_TIME",
+        "modified_date": "AEDAT",
+        "modified_time": "AEZET",
+        "generated_timestamp": "CURRENT_TIMESTAMP"
+      },
+      "notes": [
+        "ZSVLEG52010=출하 포장 테이블. DELIVERY+CARTON 복합키.",
+        "CARTON=카톤 번호. qty_i에 CARTON값을 저장하여 SUM(qty_i)으로 박스수 집계.",
+        "PLANT=P1M1 필터. 제외창고(63D0/63J0/63P0/13H0)는 서버 조회 단계에서 필터.",
+        "DELIVERY=VBRP.VGBEL(DO번호) 조인 키. SD_DATE=출하일자."
+      ]
+    },
+    {
+      "id": "shipment_amount_dep",
+      "title": "DEP 출하금액(ZTSDJK0120)",
+      "domain": "shipment_amount",
+      "enabled": true,
+      "mapping_confirmed": true,
+      "connection": "DEP",
+      "index": "powerconnect_dep",
+      "source": "DEP",
+      "event_type": "TREAD_DYN",
+      "table": "ZTSDJK0120",
+      "mode": "upsert",
+      "key_fields": [
+        "VBELN",
+        "POSNR"
+      ],
+      "poll_seconds": 60,
+      "overlap_seconds": 300,
+      "max_window_seconds": 3600,
+      "max_events": 50000,
+      "bootstrap_from": "month_start",
+      "scope_filters": {},
+      "delete_rule": null,
+      "allow_event_time_version": true,
+      "inventory_semantics_confirmed": true,
+      "fields": {
+        "document_no": "VGBEL",
+        "box_no": null,
+        "material": "MATNR",
+        "quantity": {
+          "value": 0
+        },
+        "amount": "KZWI3",
+        "exchange_rate": "WAERK",
+        "unit": {
+          "value": "USD"
+        },
+        "plant": "WERKS",
+        "warehouse": "LGORT",
+        "location": null,
+        "customer_key": "KUNAG",
+        "business_date": "FKDAT",
+        "business_time": "ERZET",
+        "modified_date": "ERDAT",
+        "modified_time": "ERZET",
+        "generated_timestamp": "CURRENT_TIMESTAMP"
+      },
+      "notes": [
+        "ZTSDJK0120=출하금액 상세 테이블. VBELN+POSNR=VBRP와 동일한 복합키.",
+        "KZWI3=USD 출하금액 (이미 USD 환산됨, 추가 KURSK 변환 불필요).",
+        "VBRP(VBELN+POSNR)와 1:1 조인. KZWI3가 없을 때만 VBRP NETWR fallback.",
+        "WAERK=통화(KRW/USD). KZWI3는 WAERK와 무관하게 USD 금액으로 사용.",
+        "business_date=FKDAT(청구일자), business_time=ERZET(청구시간).",
+        "plant=WERKS, warehouse=LGORT, customer_key=KUNAG."
+      ]
+    }
+  ],
+  "oracle_sources": [
+    {
+      "id": "conversion",
+      "table": "SCM_INFO.SCM_FABIN_CONV_FAM6_MST_M",
+      "kind": "conversion",
+      "enabled": true,
+      "query_file": "config/queries/conversion.sql",
+      "max_rows": 500000,
+      "allow_empty": false,
+      "mapping": {
+        "confirmed": true,
+        "fields": {
+          "material": "ITEM",
+          "period_ym": {
+            "value": ""
+          },
+          "unit": "UNIT",
+          "eq_per_unit": "EQQTY"
+        },
+        "filters": {
+          "USE_FLAG": [
+            "Y",
+            "y"
+          ]
+        },
+        "factor_multiplier": "1"
+      }
+    },
+    {
+      "id": "product",
+      "table": "MST_PAX_ITEM",
+      "kind": "product",
+      "enabled": true,
+      "query_file": null,
+      "max_rows": 500000,
+      "allow_empty": false,
+      "mapping": {
+        "confirmed": true,
+        "fields": {
+          "material": "ITEM",
+          "product_name": "PRODUCT",
+          "product_group": "PRODUCTGROUP"
+        },
+        "filters": {}
+      }
+    },
+    {
+      "id": "customer",
+      "table": "GUI_SITEORGHRCY",
+      "kind": "customer",
+      "enabled": true,
+      "query_file": null,
+      "max_rows": 500000,
+      "allow_empty": false,
+      "mapping": {
+        "confirmed": true,
+        "fields": {
+          "customer_key": "ORGSITEID",
+          "customer_name": "SITENAME",
+          "customer_group": "ORGLEVEL1"
+        },
+        "filters": {
+          "ISVALID": [
+            "Y",
+            "y"
+          ]
+        }
+      }
+    },
+    {
+      "id": "shipment_plan",
+      "table": "TAR_D_PLAN_SELL_ESCM",
+      "kind": "shipment_plan",
+      "enabled": true,
+      "query_file": "config/queries/shipment_plan.sql",
+      "max_rows": 500000,
+      "allow_empty": false,
+      "mapping": {
+        "confirmed": true,
+        "fields": {
+          "period_ym": "PLAN_YYYYMM",
+          "plan_version": {
+            "value": "BASE"
+          }
+        },
+        "filters": {
+          "CONV_FLAG": [
+            "N"
+          ],
+          "COMPANY_TYPE": [
+            "S"
+          ]
+        },
+        "metrics": [
+          {
+            "metric": "EA",
+            "display_unit": "EA",
+            "field": "CONS_QTY",
+            "multiplier": "1"
+          },
+          {
+            "metric": "USD",
+            "display_unit": "USD",
+            "field": "USD_AMT",
+            "multiplier": "1"
+          }
+        ],
+        "grain": {
+          "material": "ITEM_CODE",
+          "product_group": "GFAMILY1",
+          "customer_key": null,
+          "plant": null,
+          "warehouse": null
+        },
+        "actual_sources": [
+          "shipment_dep"
+        ],
+        "scope_confirmed": true,
+        "aggregation": "sum",
+        "row_key_fields": [
+          "SPMON",
+          "PLAN_YYYYMM",
+          "PLAN_NAME",
+          "DATA_FLAG",
+          "ITEM_CODE",
+          "GC_CODE",
+          "CONS_ITEM_CODE"
+        ]
+      }
+    },
+    {
+      "id": "inbound_plan",
+      "table": "GUI_F_FORECAST_WEEK",
+      "kind": "inbound_plan",
+      "enabled": true,
+      "query_file": "config/queries/inbound_plan.sql",
+      "max_rows": 500000,
+      "allow_empty": false,
+      "mapping": {
+        "confirmed": true,
+        "fields": {
+          "period_ym": "FMONTH",
+          "plan_version": "FWEEK"
+        },
+        "filters": {},
+        "metrics": [
+          {
+            "metric": "EA",
+            "display_unit": "EA",
+            "field": "FCST_QTY",
+            "multiplier": "1"
+          }
+        ],
+        "grain": {
+          "material": "ITEM",
+          "product_group": "PRODUCTGROUP",
+          "customer_key": "SITEID",
+          "plant": null,
+          "warehouse": null
+        },
+        "actual_sources": [
+          "inbound_dep"
+        ],
+        "scope_confirmed": true,
+        "aggregation": "sum",
+        "row_key_fields": [
+          "PLANID",
+          "ITEM",
+          "FMONTH",
+          "FWEEK",
+          "SITEID"
+        ]
+      }
+    }
+  ]
+}

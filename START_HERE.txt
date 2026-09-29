@@ -1,0 +1,22 @@
+SCMRealtimeDB Portable 1.2.0
+==========================
+
+화면부터 확인: site/index.html을 브라우저에서 여세요. 완전 합성 데이터입니다.
+실제 로컬 API 데모: DEMO.cmd. Python 3.11+만 필요합니다.
+
+회사 실행:
+1. 새 폴더에 압축 해제.
+2. SETUP.cmd 실행 (기존 .env는 보존).
+3. .env의 회사 승인 연결 정보를 입력하고 CHECK.cmd.
+4. START.cmd 실행. http://127.0.0.1:8765/ 자동 열기.
+
+Oracle은 별도 설치된 드라이버와 Thick Instant Client가 필요합니다.
+자동 패키지 다운로드 / 보안정책 변경은 하지 않습니다.
+실제 DB는 코드 폴더 밖 LOCALAPPDATA/SCMRealtimeDB/live에 저장합니다.
+기존 DB 삭제나 reset-source로 오류를 우회하지 마세요.
+회사 서버 실접속 / SAP 정합성 / Windows 실기동은 이번 환경에서 검증하지 못했습니다.
+
+GitHub 게시 상태: 이번 작업에서는 신규 repo 생성과 Pages 게시가 완료되지 않았습니다.
+PUBLISH_GITHUB.cmd는 사용자 PC의 인증된 GitHub CLI로 처음 게시하는 별도 도구입니다.
+소스 비공개 repo + 합성 데이터 공개 demo repo를 생성하며 동명 repo는 덮어쓰지 않습니다.
+상세 사항: README.md와 docs/RESTORATION.md.

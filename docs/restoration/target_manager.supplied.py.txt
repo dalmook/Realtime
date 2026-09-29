@@ -1,0 +1,872 @@
+"""
+Dynamic Target Rule Manager — 수기 목표 관리 백엔드 모듈.
+
+핵심 구조:
+  manual_target       — 목표 본체 (기간/구분/Metric/목표값/우선순위/활성/합산가능/메모)
+  manual_target_filter— 적용조건 (target_id별 다중 조건, field_key/operator/filter_value)
+
+우선순위: Manual > System(Oracle plan_monthly) > None
+중복 합산 방지: 동일 Scope에 수기 목표가 있으면 System 목표 무시 (additive=1인 경우만 합산)
+SQL Injection 방지: field/operator whitelist + parameter binding
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from datetime import datetime
+from typing import Any
+
+# ── Constants ────────────────────────────────────────────
+
+SCALE = 1_000_000
+
+# field_key → SQL expression (for shipment / inbound)
+# shipment: alias 's' for shipment_current, 'k' for shipment_amount_kzwi3
+# inbound: alias 's' for inbound_current
+FIELD_WHITELIST: dict[str, dict[str, str]] = {
+    "customer_name": {
+        "label": "거래선명",
+        "shipment": "COALESCE(k.soname, '')",
+        "inbound": "''",  # inbound has no customer name
+    },
+    "customer_code": {
+        "label": "거래선코드",
+        "shipment": "COALESCE(k.kunag, s.customer_key)",
+        "inbound": "s.customer_key",
+    },
+    "product_group": {
+        "label": "제품군",
+        "shipment": None,  # special: subquery on dim_product
+        "inbound": None,
+    },
+    "item": {
+        "label": "ITEM",
+        "shipment": "substr(s.material,1,18)",
+        "inbound": "substr(s.material,1,18)",
+    },
+    "item_prefix": {
+        "label": "ITEM Prefix",
+        "shipment": "substr(s.material,1,18)",
+        "inbound": "substr(s.material,1,18)",
+    },
+    "plant": {
+        "label": "Plant",
+        "shipment": "s.plant",
+        "inbound": "s.plant",
+    },
+    "warehouse": {
+        "label": "창고",
+        "shipment": "s.warehouse",
+        "inbound": "s.warehouse",
+    },
+    "country": {
+        "label": "국가",
+        "shipment": "json_extract(s.payload_json,'$.ALAND')",
+        "inbound": "''",
+    },
+    "sales_org": {
+        "label": "판매법인",
+        "shipment": "json_extract(s.payload_json,'$.VKORG_ANA')",
+        "inbound": "''",
+    },
+    "ship_type": {
+        "label": "출하유형",
+        "shipment": "json_extract(s.payload_json,'$.FKART_ANA')",
+        "inbound": "''",
+    },
+}
+
+# operator → SQL template (uses : placeholders)
+OPERATOR_WHITELIST: dict[str, str] = {
+    "=": "{field} = :val",
+    "!=": "{field} != :val",
+    "IN": "{field} IN ({placeholders})",
+    "NOT IN": "{field} NOT IN ({placeholders})",
+    "Starts With": "{field} LIKE :val || '%'",
+    "Contains": "{field} LIKE '%' || :val || '%'",
+    "BETWEEN": "{field} BETWEEN :val1 AND :val2",
+}
+
+VALID_METRICS = {"EA", "USD", "BOX", "EQ_DRAM", "EQ_FLASH", "EQ"}
+VALID_DIRECTIONS = {"shipment", "inbound"}
+
+# Excluded warehouses (must match server.py)
+EXCLUDED_WAREHOUSES = ["63D0", "63J0", "63P0", "13H0"]
+
+# ── DB Helper ─────────────────────────────────────────────
+
+
+def _get_db_path() -> str:
+    """Get the live DB path (same as server.py)."""
+    import os
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "SCMRealtimeDB", "live", "scm_live.sqlite"
+    )
+
+
+def get_db() -> sqlite3.Connection:
+    """Open a read-write connection to the live DB."""
+    path = _get_db_path()
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def _now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# ── Filter SQL Builder (safe, parameterized) ──────────────
+
+
+def build_filter_sql(
+    filters: list[dict],
+    direction: str,
+    param_prefix: str = "tf",
+) -> tuple[str, dict[str, Any]]:
+    """
+    Build safe WHERE clause from filter list using whitelist + parameter binding.
+
+    Returns (where_clause, params_dict) — clause does NOT include leading "AND" or "WHERE".
+    Caller should prepend "AND" or "WHERE" as needed.
+
+    Each filter: {"field_key": str, "operator": str, "filter_value": str}
+    filter_value for IN/NOT IN: comma-separated (e.g. "DRAM,SSD")
+    filter_value for BETWEEN: comma-separated two values (e.g. "100,200")
+    """
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    counter = 0
+
+    for f in filters:
+        field_key = f.get("field_key", "")
+        operator = f.get("operator", "")
+        filter_value = f.get("filter_value", "")
+
+        # Validate field_key
+        if field_key not in FIELD_WHITELIST:
+            raise ValueError(f"Invalid field_key: {field_key}")
+        field_def = FIELD_WHITELIST[field_key]
+
+        # Validate operator
+        if operator not in OPERATOR_WHITELIST:
+            raise ValueError(f"Invalid operator: {operator}")
+
+        # Get SQL expression for this field+direction
+        sql_expr = field_def.get(direction)
+        if sql_expr is None and field_key == "product_group":
+            # Special: subquery on dim_product
+            sql_expr = (
+                f"substr({'s'}.material,1,18) IN "
+                f"(SELECT substr(material,1,18) FROM dim_product WHERE product_group = :{param_prefix}_pg_{counter})"
+            )
+            pname = f"{param_prefix}_pg_{counter}"
+            params[pname] = filter_value
+            clauses.append(sql_expr)
+            counter += 1
+            continue
+        if sql_expr is None or sql_expr == "''":
+            raise ValueError(f"Field '{field_key}' not available for direction '{direction}'")
+
+        # Build SQL based on operator
+        tmpl = OPERATOR_WHITELIST[operator]
+
+        if operator in ("IN", "NOT IN"):
+            # Parse comma-separated values
+            values = [v.strip() for v in filter_value.split(",") if v.strip()]
+            if not values:
+                raise ValueError(f"Empty value list for {operator}")
+            # Generate unique placeholders
+            ph_names = []
+            for i, v in enumerate(values):
+                pname = f"{param_prefix}_{counter}_{i}"
+                ph_names.append(f":{pname}")
+                params[pname] = v
+            placeholders = ", ".join(ph_names)
+            clause = tmpl.format(field=sql_expr, placeholders=placeholders)
+            clauses.append(clause)
+        elif operator == "BETWEEN":
+            parts = [v.strip() for v in filter_value.split(",")]
+            if len(parts) != 2:
+                raise ValueError("BETWEEN requires exactly 2 comma-separated values")
+            p1 = f"{param_prefix}_{counter}_1"
+            p2 = f"{param_prefix}_{counter}_2"
+            params[p1] = parts[0]
+            params[p2] = parts[1]
+            clause = tmpl.format(field=sql_expr, val1=f":{p1}", val2=f":{p2}")
+            clauses.append(clause)
+        elif operator == "Starts With":
+            pname = f"{param_prefix}_{counter}"
+            params[pname] = filter_value
+            clause = tmpl.format(field=sql_expr, val=f":{pname}")
+            clauses.append(clause)
+        elif operator == "Contains":
+            pname = f"{param_prefix}_{counter}"
+            params[pname] = filter_value
+            clause = tmpl.format(field=sql_expr, val=f":{pname}")
+            clauses.append(clause)
+        else:
+            # =, !=
+            pname = f"{param_prefix}_{counter}"
+            params[pname] = filter_value
+            clause = tmpl.format(field=sql_expr, val=f":{pname}")
+            clauses.append(clause)
+
+        counter += 1
+
+    where = " AND ".join(clauses) if clauses else "1=1"
+    return where, params
+
+
+# ── Shipment / Inbound base filter (matches server.py) ────
+
+def _base_filter_clauses(direction: str) -> tuple[list[str], dict[str, Any]]:
+    """Return base filter clauses (same as server.py _shipment/_inbound_base_filter)."""
+    clauses = []
+    params = {}
+    clauses.append("s.deleted=0")
+    if direction == "shipment":
+        clauses.append("s.plant='P1M1'")
+        clauses.append("s.document_no LIKE '6%'")
+    else:
+        clauses.append("s.plant='P1M1'")
+        clauses.append("s.c_id IN ('CO','GO')")
+        clauses.append("s.i_type != '34'")
+    # Excluded warehouses
+    ex_ph = []
+    for i, wh in enumerate(EXCLUDED_WAREHOUSES):
+        pname = f"ex_wh_{i}"
+        ex_ph.append(f":{pname}")
+        params[pname] = wh
+    clauses.append(f"s.warehouse NOT IN ({', '.join(ex_ph)})")
+    return clauses, params
+
+
+def _build_actual_query(
+    direction: str,
+    metric: str,
+    period_ym: str,
+    filters: list[dict],
+    count_only: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Build SQL query to compute actual achievement for given target scope.
+
+    Returns (sql, params).
+    """
+    base_clauses, base_params = _base_filter_clauses(direction)
+
+    # Build filter clauses from manual_target_filter
+    filter_where, filter_params = build_filter_sql(filters, direction, param_prefix="mtf")
+
+    # Date filter: period_ym (YYYYMM)
+    date_clause = f"substr(s.business_date,1,6) = :period_ym"
+
+    all_clauses = base_clauses + [date_clause]
+    if filter_where != "1=1":
+        all_clauses.append(f"({filter_where})")
+    where = " AND ".join(all_clauses)
+
+    all_params = {**base_params, **filter_params, "period_ym": period_ym}
+
+    # Value expression
+    if direction == "shipment":
+        join_clause = (
+            "LEFT JOIN shipment_amount_kzwi3 k "
+            "ON json_extract(s.record_key, '$[0]') = k.vbeln "
+            "AND json_extract(s.record_key, '$[1]') = k.posnr"
+        )
+    else:
+        join_clause = ""
+
+    # Metric value expression
+    if metric == "EA":
+        val_expr = "s.qty_i"
+    elif metric == "USD":
+        if direction == "shipment":
+            val_expr = f"k.kzwi3 * {SCALE}"
+        else:
+            val_expr = "s.amount_i"
+    elif metric == "BOX":
+        val_expr = "s.box_no"
+    elif metric in ("EQ_DRAM", "EQ_FLASH"):
+        unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH"
+        join_clause += (
+            f" LEFT JOIN (SELECT material AS conv_mat, eq_per_unit "
+            f"FROM dim_conversion WHERE unit = '{unit}') "
+            f"ON substr(s.material,1,18) = conv_mat"
+        )
+        val_expr = "s.qty_i * CAST(eq_per_unit AS REAL)"
+    else:
+        val_expr = "s.qty_i"
+
+    if count_only:
+        sql = f"SELECT COUNT(*) cnt FROM {direction}_current s {join_clause} WHERE {where}"
+    else:
+        if metric == "BOX" and direction == "inbound":
+            sql = (
+                f"SELECT COUNT(DISTINCT s.box_no) AS val, COUNT(*) AS cnt "
+                f"FROM {direction}_current s {join_clause} WHERE {where}"
+            )
+        elif metric == "BOX":
+            sql = (
+                f"SELECT COALESCE(SUM({val_expr}),0) AS val, COUNT(*) AS cnt "
+                f"FROM {direction}_current s {join_clause} WHERE {where}"
+            )
+        else:
+            sql = (
+                f"SELECT COALESCE(SUM({val_expr}),0) AS val, COUNT(*) AS cnt "
+                f"FROM {direction}_current s {join_clause} WHERE {where}"
+            )
+
+    return sql, all_params
+
+
+def _descale(val, metric: str) -> float:
+    """Convert DB stored value to display value."""
+    if val is None:
+        return 0.0
+    if metric == "BOX":
+        return float(val)
+    return float(val) / SCALE
+
+
+# ── CRUD Operations ───────────────────────────────────────
+
+
+def create_target(data: dict) -> dict:
+    """Create a new manual target with filters."""
+    # Validate
+    period_ym = data.get("period_ym", "").strip()
+    direction = data.get("direction", "").strip()
+    metric = data.get("metric", "").strip().upper()
+    target_name = data.get("target_name", "").strip()
+    target_value = float(data.get("target_value", 0))
+    filters = data.get("filters", [])
+
+    if not period_ym or len(period_ym) != 6:
+        return {"error": "period_ym must be YYYYMM (6 digits)"}
+    if direction not in VALID_DIRECTIONS:
+        return {"error": f"direction must be one of {VALID_DIRECTIONS}"}
+    if metric not in VALID_METRICS:
+        return {"error": f"metric must be one of {VALID_METRICS}"}
+    if not target_name:
+        return {"error": "target_name is required"}
+    if target_value <= 0:
+        return {"error": "target_value must be positive"}
+
+    priority = int(data.get("priority", 100))
+    enabled = int(data.get("enabled", 1))
+    additive = int(data.get("additive", 0))
+    memo = data.get("memo", "").strip()
+
+    # Validate filters
+    for f in filters:
+        if f.get("field_key") not in FIELD_WHITELIST:
+            return {"error": f"Invalid field_key: {f.get('field_key')}"}
+        if f.get("operator") not in OPERATOR_WHITELIST:
+            return {"error": f"Invalid operator: {f.get('operator')}"}
+        if not f.get("filter_value", "").strip():
+            return {"error": "filter_value cannot be empty"}
+
+    con = get_db()
+    try:
+        cur = con.cursor()
+        now = _now_iso()
+        cur.execute(
+            """INSERT INTO manual_target
+               (period_ym, direction, metric, target_name, target_value,
+                priority, enabled, additive, memo, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (period_ym, direction, metric, target_name, target_value,
+             priority, enabled, additive, memo, now, now)
+        )
+        target_id = cur.lastrowid
+
+        for seq, f in enumerate(filters):
+            cur.execute(
+                """INSERT INTO manual_target_filter
+                   (target_id, seq, field_key, operator, filter_value)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (target_id, seq, f["field_key"], f["operator"], f["filter_value"].strip())
+            )
+        con.commit()
+        return {"target_id": target_id, "ok": True}
+    except Exception as e:
+        con.rollback()
+        return {"error": str(e)}
+    finally:
+        con.close()
+
+
+def list_targets(period_ym: str | None = None, direction: str | None = None) -> dict:
+    """List all targets (optionally filtered by period/direction), with filters and actuals."""
+    con = get_db()
+    try:
+        where_parts = []
+        params = {}
+        if period_ym:
+            where_parts.append("t.period_ym = :pym")
+            params["pym"] = period_ym
+        if direction:
+            where_parts.append("t.direction = :dir")
+            params["dir"] = direction
+        where = " AND ".join(where_parts) if where_parts else "1=1"
+
+        rows = con.execute(
+            f"""SELECT t.* FROM manual_target t
+                WHERE {where}
+                ORDER BY t.period_ym DESC, t.direction, t.priority, t.target_name""",
+            params
+        ).fetchall()
+
+        result = []
+        for r in rows:
+            tid = r["target_id"]
+            # Get filters
+            frows = con.execute(
+                """SELECT field_key, operator, filter_value, seq
+                   FROM manual_target_filter
+                   WHERE target_id = ?
+                   ORDER BY seq""",
+                [tid]
+            ).fetchall()
+            filters = [dict(fr) for fr in frows]
+
+            # Compute actual
+            actual_info = {"actual": 0, "count": 0, "achievement": 0, "remaining": 0}
+            if r["enabled"]:
+                actual_info = _compute_actual(
+                    con, r["period_ym"], r["direction"], r["metric"], filters
+                )
+
+            target_val = r["target_value"]
+            actual_val = actual_info["actual"]
+            achievement = round(actual_val / target_val * 100, 1) if target_val else 0
+            remaining = round(target_val - actual_val, 2)
+
+            result.append({
+                "target_id": tid,
+                "period_ym": r["period_ym"],
+                "direction": r["direction"],
+                "metric": r["metric"],
+                "target_name": r["target_name"],
+                "target_value": target_val,
+                "priority": r["priority"],
+                "enabled": bool(r["enabled"]),
+                "additive": bool(r["additive"]),
+                "memo": r["memo"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "filters": filters,
+                "actual": actual_val,
+                "actual_count": actual_info["count"],
+                "achievement": achievement,
+                "remaining": remaining,
+                "source": "MANUAL",
+            })
+        return {"targets": result}
+    finally:
+        con.close()
+
+
+def get_target(target_id: int) -> dict:
+    """Get a single target with filters and actual."""
+    con = get_db()
+    try:
+        r = con.execute(
+            "SELECT * FROM manual_target WHERE target_id = ?",
+            [target_id]
+        ).fetchone()
+        if not r:
+            return {"error": "Target not found"}
+
+        frows = con.execute(
+            """SELECT field_key, operator, filter_value, seq
+               FROM manual_target_filter
+               WHERE target_id = ?
+               ORDER BY seq""",
+            [target_id]
+        ).fetchall()
+        filters = [dict(fr) for fr in frows]
+
+        actual_info = {"actual": 0, "count": 0}
+        if r["enabled"]:
+            actual_info = _compute_actual(
+                con, r["period_ym"], r["direction"], r["metric"], filters
+            )
+
+        target_val = r["target_value"]
+        actual_val = actual_info["actual"]
+        achievement = round(actual_val / target_val * 100, 1) if target_val else 0
+        remaining = round(target_val - actual_val, 2)
+
+        return {
+            "target_id": r["target_id"],
+            "period_ym": r["period_ym"],
+            "direction": r["direction"],
+            "metric": r["metric"],
+            "target_name": r["target_name"],
+            "target_value": target_val,
+            "priority": r["priority"],
+            "enabled": bool(r["enabled"]),
+            "additive": bool(r["additive"]),
+            "memo": r["memo"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "filters": filters,
+            "actual": actual_val,
+            "actual_count": actual_info["count"],
+            "achievement": achievement,
+            "remaining": remaining,
+            "source": "MANUAL",
+        }
+    finally:
+        con.close()
+
+
+def update_target(target_id: int, data: dict) -> dict:
+    """Update an existing target (including filters)."""
+    con = get_db()
+    try:
+        r = con.execute("SELECT * FROM manual_target WHERE target_id = ?", [target_id]).fetchone()
+        if not r:
+            return {"error": "Target not found"}
+
+        # Validate
+        metric = data.get("metric", r["metric"]).strip().upper()
+        direction = data.get("direction", r["direction"]).strip()
+        period_ym = data.get("period_ym", r["period_ym"]).strip()
+        target_name = data.get("target_name", r["target_name"]).strip()
+        target_value = float(data.get("target_value", r["target_value"]))
+        filters = data.get("filters", None)
+
+        if metric not in VALID_METRICS:
+            return {"error": f"metric must be one of {VALID_METRICS}"}
+        if direction not in VALID_DIRECTIONS:
+            return {"error": f"direction must be one of {VALID_DIRECTIONS}"}
+
+        priority = int(data.get("priority", r["priority"]))
+        enabled = int(data.get("enabled", r["enabled"]))
+        additive = int(data.get("additive", r["additive"]))
+        memo = data.get("memo", r["memo"]).strip()
+
+        # Validate filters if provided
+        if filters is not None:
+            for f in filters:
+                if f.get("field_key") not in FIELD_WHITELIST:
+                    return {"error": f"Invalid field_key: {f.get('field_key')}"}
+                if f.get("operator") not in OPERATOR_WHITELIST:
+                    return {"error": f"Invalid operator: {f.get('operator')}"}
+                if not f.get("filter_value", "").strip():
+                    return {"error": "filter_value cannot be empty"}
+
+        cur = con.cursor()
+        cur.execute(
+            """UPDATE manual_target SET
+               period_ym=?, direction=?, metric=?, target_name=?, target_value=?,
+               priority=?, enabled=?, additive=?, memo=?, updated_at=?
+               WHERE target_id=?""",
+            (period_ym, direction, metric, target_name, target_value,
+             priority, enabled, additive, memo, _now_iso(), target_id)
+        )
+
+        # Replace filters if provided
+        if filters is not None:
+            cur.execute("DELETE FROM manual_target_filter WHERE target_id=?", [target_id])
+            for seq, f in enumerate(filters):
+                cur.execute(
+                    """INSERT INTO manual_target_filter
+                       (target_id, seq, field_key, operator, filter_value)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (target_id, seq, f["field_key"], f["operator"], f["filter_value"].strip())
+                )
+        con.commit()
+        return {"target_id": target_id, "ok": True}
+    except Exception as e:
+        con.rollback()
+        return {"error": str(e)}
+    finally:
+        con.close()
+
+
+def delete_target(target_id: int) -> dict:
+    """Delete a target and its filters (cascade)."""
+    con = get_db()
+    try:
+        con.execute("DELETE FROM manual_target_filter WHERE target_id=?", [target_id])
+        result = con.execute("DELETE FROM manual_target WHERE target_id=?", [target_id])
+        con.commit()
+        if result.rowcount == 0:
+            return {"error": "Target not found"}
+        return {"target_id": target_id, "ok": True, "deleted": True}
+    except Exception as e:
+        con.rollback()
+        return {"error": str(e)}
+    finally:
+        con.close()
+
+
+def copy_target(target_id: int, data: dict | None = None) -> dict:
+    """Copy a target (and its filters) to a new target. Optionally override fields."""
+    con = get_db()
+    try:
+        r = con.execute("SELECT * FROM manual_target WHERE target_id=?", [target_id]).fetchone()
+        if not r:
+            return {"error": "Target not found"}
+
+        frows = con.execute(
+            "SELECT field_key, operator, filter_value FROM manual_target_filter WHERE target_id=? ORDER BY seq",
+            [target_id]
+        ).fetchall()
+
+        data = data or {}
+        new_name = data.get("target_name", f"{r['target_name']} (복사)")
+        new_period = data.get("period_ym", r["period_ym"])
+        new_direction = data.get("direction", r["direction"])
+        new_metric = data.get("metric", r["metric"])
+        new_value = float(data.get("target_value", r["target_value"]))
+
+        cur = con.cursor()
+        now = _now_iso()
+        cur.execute(
+            """INSERT INTO manual_target
+               (period_ym, direction, metric, target_name, target_value,
+                priority, enabled, additive, memo, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_period, new_direction, new_metric, new_name, new_value,
+             r["priority"], 1, r["additive"], r["memo"], now, now)
+        )
+        new_id = cur.lastrowid
+        for seq, fr in enumerate(frows):
+            cur.execute(
+                """INSERT INTO manual_target_filter
+                   (target_id, seq, field_key, operator, filter_value)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (new_id, seq, fr["field_key"], fr["operator"], fr["filter_value"])
+            )
+        con.commit()
+        return {"target_id": new_id, "ok": True, "copied_from": target_id}
+    except Exception as e:
+        con.rollback()
+        return {"error": str(e)}
+    finally:
+        con.close()
+
+
+def copy_month_targets(from_ym: str, to_ym: str, direction: str | None = None) -> dict:
+    """Copy all targets from one month to another (전월 목표 복사)."""
+    con = get_db()
+    try:
+        rows = con.execute(
+            "SELECT target_id FROM manual_target WHERE period_ym=? "
+            + ("AND direction=?" if direction else ""),
+            [from_ym] + ([direction] if direction else [])
+        ).fetchall()
+        count = 0
+        for r in rows:
+            res = copy_target(r["target_id"], {"period_ym": to_ym})
+            if "error" in res:
+                con.rollback()
+                return res
+            count += 1
+        return {"ok": True, "copied_count": count, "from_ym": from_ym, "to_ym": to_ym}
+    except Exception as e:
+        con.rollback()
+        return {"error": str(e)}
+    finally:
+        con.close()
+
+
+# ── Actual computation ───────────────────────────────────
+
+
+def _compute_actual(
+    con: sqlite3.Connection,
+    period_ym: str,
+    direction: str,
+    metric: str,
+    filters: list[dict],
+) -> dict:
+    """Compute actual achievement for given target scope."""
+    try:
+        sql, params = _build_actual_query(direction, metric, period_ym, filters)
+        row = con.execute(sql, params).fetchone()
+        val = row["val"] if "val" in row.keys() else 0
+        cnt = row["cnt"] if "cnt" in row.keys() else 0
+        actual = _descale(val, metric)
+        return {"actual": round(actual, 2), "count": cnt}
+    except Exception as e:
+        return {"actual": 0, "count": 0, "error": str(e)}
+
+
+def preview_target(data: dict) -> dict:
+    """
+    Preview: given target specs (period/direction/metric/filters), compute
+    matching count and actual WITHOUT saving.
+    """
+    period_ym = data.get("period_ym", "").strip()
+    direction = data.get("direction", "").strip()
+    metric = data.get("metric", "").strip().upper()
+    filters = data.get("filters", [])
+
+    if not period_ym or direction not in VALID_DIRECTIONS or metric not in VALID_METRICS:
+        return {"error": "Invalid period_ym, direction, or metric"}
+
+    con = get_db()
+    try:
+        # Count
+        sql_cnt, params_cnt = _build_actual_query(
+            direction, metric, period_ym, filters, count_only=True
+        )
+        cnt_row = con.execute(sql_cnt, params_cnt).fetchone()
+        count = cnt_row["cnt"] if cnt_row else 0
+
+        # Actual
+        actual_info = _compute_actual(con, period_ym, direction, metric, filters)
+
+        return {
+            "count": count,
+            "actual": actual_info["actual"],
+            "metric": metric,
+            "direction": direction,
+            "period_ym": period_ym,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        con.close()
+
+
+# ── Priority resolution: Manual > System > None ──────────
+
+
+def resolve_target(
+    con: sqlite3.Connection,
+    period_ym: str,
+    direction: str,
+    metric: str,
+) -> dict:
+    """
+    Resolve which target to use for a given scope.
+    Priority: Manual (enabled) > System (plan_monthly) > None.
+    Does NOT sum duplicates — picks highest-priority enabled manual target.
+    If additive=1, sums all additive targets for same scope.
+
+    Returns: {"source": "MANUAL"|"SYSTEM"|"NONE", "target_value": float, "target_id": int|None, "info": str}
+    """
+    # Check manual targets
+    rows = con.execute(
+        """SELECT target_id, target_name, target_value, priority, additive, enabled
+           FROM manual_target
+           WHERE period_ym=? AND direction=? AND metric=? AND enabled=1
+           ORDER BY priority, target_id""",
+        [period_ym, direction, metric]
+    ).fetchall()
+
+    if rows:
+        # Separate additive vs non-additive
+        additive_rows = [r for r in rows if r["additive"]]
+        primary_rows = [r for r in rows if not r["additive"]]
+
+        if primary_rows:
+            # Use the first (highest priority) non-additive target
+            r = primary_rows[0]
+            return {
+                "source": "MANUAL",
+                "target_value": r["target_value"],
+                "target_id": r["target_id"],
+                "target_name": r["target_name"],
+                "info": f"수기 목표: {r['target_name']}",
+            }
+        elif additive_rows:
+            # Sum all additive targets
+            total = sum(r["target_value"] for r in additive_rows)
+            names = ", ".join(r["target_name"] for r in additive_rows)
+            return {
+                "source": "MANUAL",
+                "target_value": total,
+                "target_id": None,
+                "target_name": names,
+                "info": f"수기 목표(합산): {names}",
+            }
+
+    # Fall back to System (plan_monthly)
+    # Use the same logic as server.py _plan_target
+    try:
+        if metric == "BOX":
+            return {"source": "NONE", "target_value": 0, "target_id": None, "info": "목표 없음"}
+        if metric in ("EQ_DRAM", "EQ_FLASH"):
+            unit = "PC-DRAM" if metric == "EQ_DRAM" else "PC-FLASH"
+            row = con.execute(
+                """SELECT COALESCE(SUM(p.target_i * CAST(dc.eq_per_unit AS REAL)),0) tgt
+                   FROM plan_monthly p
+                   LEFT JOIN dim_conversion dc
+                     ON substr(p.material,1,18)=dc.material AND dc.unit=?
+                   WHERE p.direction=? AND p.metric='EA' AND p.period_ym=?""",
+                [unit, direction, period_ym]
+            ).fetchone()
+            if row and row["tgt"] and row["tgt"] > 0:
+                return {
+                    "source": "SYSTEM",
+                    "target_value": round(float(row["tgt"]) / SCALE, 2),
+                    "target_id": None,
+                    "target_name": "Oracle 목표",
+                    "info": "Oracle 목표 (plan_monthly)",
+                }
+        else:
+            row = con.execute(
+                "SELECT COALESCE(SUM(target_i),0) tgt FROM plan_monthly WHERE direction=? AND metric=? AND period_ym=?",
+                [direction, metric, period_ym]
+            ).fetchone()
+            if row and row["tgt"] and row["tgt"] > 0:
+                return {
+                    "source": "SYSTEM",
+                    "target_value": round(float(row["tgt"]) / SCALE, 2),
+                    "target_id": None,
+                    "target_name": "Oracle 목표",
+                    "info": "Oracle 목표 (plan_monthly)",
+                }
+    except Exception:
+        pass
+
+    return {"source": "NONE", "target_value": 0, "target_id": None, "info": "목표 없음"}
+
+
+def resolve_target_api(params: dict) -> dict:
+    """API endpoint: resolve target for given scope."""
+    period_ym = params.get("period_ym", "").strip()
+    direction = params.get("direction", "").strip()
+    metric = params.get("metric", "EA").strip().upper()
+
+    if not period_ym or direction not in VALID_DIRECTIONS:
+        return {"error": "period_ym and direction required"}
+
+    con = get_db()
+    try:
+        result = resolve_target(con, period_ym, direction, metric)
+        return result
+    finally:
+        con.close()
+
+
+# ── Field/Operator metadata for UI ──────────────────────
+
+
+def get_field_metadata() -> dict:
+    """Return field and operator metadata for UI dynamic form building."""
+    fields = []
+    for key, defn in FIELD_WHITELIST.items():
+        fields.append({
+            "key": key,
+            "label": defn["label"],
+            "shipment_available": defn.get("shipment") is not None and defn.get("shipment") != "''",
+            "inbound_available": defn.get("inbound") is not None and defn.get("inbound") != "''",
+        })
+    operators = list(OPERATOR_WHITELIST.keys())
+    return {"fields": fields, "operators": operators}

@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+ZTSDJK0120 KZWI3 collector — dedup by VBELN+POSNR, month-by-month.
+"""
+import sys, os, json, ssl, time, urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+import sqlite3, datetime
+
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+from dotenv import load_dotenv
+load_dotenv(r'H:\python_pjt\SCMRealtimeDB\.env')
+
+HOST = os.environ['SPLUNK_HOST']
+PORT = os.environ['SPLUNK_PORT']
+USER = os.environ['SPLUNK_USER']
+PASSWORD = os.environ['SPLUNK_PASSWORD']
+BASE = f'https://{HOST}:{PORT}'
+DB = r'C:\Users\MASKED_USER\AppData\Local\SCMRealtimeDB\live\scm_live.sqlite'
+
+ctx = ssl._create_unverified_context()
+opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+
+def http(method, path, form=None, params=None, key=None):
+    url = BASE + path
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    headers = {'Accept': 'application/json', 'User-Agent': 'SCMRealtimeDB/1.0'}
+    if key:
+        headers['Authorization'] = f'Splunk {key}'
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode('utf-8')
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with opener.open(req, timeout=300) as resp:
+        return json.loads(resp.read())
+
+def login():
+    url = BASE + '/services/auth/login'
+    data = urllib.parse.urlencode({'username': USER, 'password': PASSWORD}).encode('utf-8')
+    headers = {'Content-Type': 'application/x-www-form-urlencoded',
+               'User-Agent': 'SCMRealtimeDB/1.0'}
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    with opener.open(req, timeout=180) as resp:
+        raw = resp.read()
+    key = ET.fromstring(raw).findtext('sessionKey')
+    if not key:
+        raise RuntimeError('No sessionKey')
+    return key
+
+def search(spl, key, max_events=500000):
+    body = http('POST', '/services/search/jobs',
+                form={'search': spl, 'output_mode': 'json', 'exec_mode': 'normal',
+                      'max_count': max_events + 1, 'status_buckets': 0}, key=key)
+    sid = body.get('sid')
+    if not sid:
+        raise RuntimeError('No SID')
+    path = '/services/search/jobs/' + urllib.parse.quote(str(sid), safe='')
+    deadline = time.monotonic() + 300
+    while True:
+        b = http('GET', path, params={'output_mode': 'json'}, key=key)
+        entries = b.get('entry', [])
+        if not entries:
+            raise RuntimeError('No entries')
+        c = entries[0]['content']
+        if c.get('isFailed') or c.get('dispatchState') in {'FAILED', 'BAD_INPUT_CANCEL'}:
+            raise RuntimeError(f'Search failed: {c.get("messages")}')
+        if c.get('isDone'):
+            break
+        if time.monotonic() > deadline:
+            raise RuntimeError('Search timeout')
+        time.sleep(0.5)
+    total = int(c.get('resultCount', 0))
+    if total > max_events:
+        raise RuntimeError(f'Too many results: {total}')
+    results = []
+    while len(results) < total:
+        n = min(5000, total - len(results))
+        b = http('GET', f'/services/search/v2/jobs/{urllib.parse.quote(str(sid), safe="")}/results',
+                 params={'output_mode': 'json', 'offset': len(results), 'count': n}, key=key)
+        page = b.get('results', [])
+        if not page:
+            break
+        results.extend(page)
+    return results
+
+def month_epochs(year, month):
+    start = datetime.datetime(year, month, 1, tzinfo=datetime.timezone.utc)
+    if month == 12:
+        end = datetime.datetime(year + 1, 1, 1, tzinfo=datetime.timezone.utc)
+    else:
+        end = datetime.datetime(year, month + 1, 1, tzinfo=datetime.timezone.utc)
+    return int(start.timestamp()), int(end.timestamp())
+
+def create_table(con):
+    con.execute('''
+        CREATE TABLE IF NOT EXISTS shipment_amount_kzwi3 (
+            vbeln        TEXT NOT NULL,
+            posnr        TEXT NOT NULL,
+            vgbel        TEXT,
+            matnr        TEXT,
+            kzwi3        REAL,
+            waerk        TEXT,
+            fkdat        TEXT,
+            collected_at TEXT,
+            PRIMARY KEY (vbeln, posnr)
+        )
+    ''')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_kzwi3_vgbel ON shipment_amount_kzwi3(vgbel)')
+    con.commit()
+
+def main():
+    print('Logging in to Splunk...')
+    key = login()
+    print('Login OK')
+
+    with open(r'H:\python_pjt\SCMRealtimeDB\config\pipeline.json', encoding='utf-8-sig') as f:
+        pipeline = json.load(f)
+    ship_src = [s for s in pipeline['splunk_sources'] if s['id'] == 'shipment_dep'][0]
+    index = ship_src['index']
+    source = ship_src['source']
+
+    con = sqlite3.connect(DB)
+    create_table(con)
+
+    # Collect month by month: 2025-09 ~ 2026-09
+    months = []
+    for m in range(9, 13):
+        months.append((2025, m))
+    for m in range(1, 10):
+        months.append((2026, m))
+
+    total_inserted = 0
+    for year, month in months:
+        lo, hi = month_epochs(year, month)
+        # Use dedup to get unique VBELN+POSNR (latest _indextime wins)
+        spl = (
+            f'search index={index} source={json.dumps(source, ensure_ascii=True)} '
+            f'EVENT_TYPE="TREAD_DYN" TABNAME="ZTSDJK0120" '
+            f'earliest={lo} latest={hi} '
+            f'| dedup VBELN POSNR sortby -_indextime '
+            f'| table VBELN POSNR VGBEL MATNR KZWI3 WAERK FKDAT'
+        )
+        print(f'  {year}-{month:02d}...', end=' ', flush=True)
+        try:
+            results = search(spl, key, max_events=500000)
+            print(f'{len(results)} unique rows')
+        except RuntimeError as e:
+            print(f'ERROR: {e}')
+            continue
+
+        batch = []
+        for r in results:
+            vbeln = r.get('VBELN', '').strip()
+            posnr = r.get('POSNR', '').strip()
+            vgbel = r.get('VGBEL', '')
+            matnr = r.get('MATNR', '')
+            kzwi3 = r.get('KZWI3', '')
+            waerk = r.get('WAERK', '')
+            fkdat = r.get('FKDAT', '')
+            try:
+                kzwi3_val = float(kzwi3) if kzwi3 else None
+            except (ValueError, TypeError):
+                kzwi3_val = None
+            batch.append((vbeln, posnr, vgbel, matnr, kzwi3_val, waerk, fkdat,
+                          time.strftime('%Y-%m-%dT%H:%M:%S')))
+
+        con.executemany('''
+            INSERT OR REPLACE INTO shipment_amount_kzwi3
+            (vbeln, posnr, vgbel, matnr, kzwi3, waerk, fkdat, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', batch)
+        con.commit()
+        total_inserted += len(results)
+
+    print(f'\nTotal inserted: {total_inserted}')
+    count = con.execute('SELECT COUNT(*) FROM shipment_amount_kzwi3').fetchone()[0]
+    print(f'Total rows in shipment_amount_kzwi3: {count}')
+
+    # Verify DO 6004265261
+    rows = con.execute(
+        'SELECT vbeln, posnr, vgbel, matnr, kzwi3, waerk, fkdat '
+        'FROM shipment_amount_kzwi3 WHERE vgbel=? LIMIT 10', ('6004265261',)
+    ).fetchall()
+    print(f'\nDO 6004265261 lookup: {len(rows)} rows')
+    for r in rows:
+        print(f'  VBELN={r[0]}, POSNR={r[1]}, VGBEL={r[2]}, MATNR={r[3]}, '
+              f'KZWI3={r[4]}, WAERK={r[5]}, FKDAT={r[6]}')
+
+    con.close()
+
+if __name__ == '__main__':
+    main()
