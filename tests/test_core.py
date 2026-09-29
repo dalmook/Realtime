@@ -75,7 +75,40 @@ class Facts(Base):
             db.ingest(old,[event(old,key='LEG1',material='OLD-P-CODE',at=at,MATNR='DEMO_A')],int(time.time())-10,month_start_epoch())
             self.assertEqual(db.query('SELECT material FROM inbound_current')[0]['material'],'OLD-P-CODE')
             db.initialize(cfg)
-            self.assertEqual(db.query('SELECT material FROM inbound_current')[0]['material'],'DEMO_A')
+            row=db.query('SELECT material FROM inbound_current')[0]
+            self.assertEqual(row['material'],'DEMO_A')
+            self.assertIn('PAYLOAD_REMAP',db.state('inbound_dep')['projection_note'])
+    def test_shipment_mapping_drift_reprojects_preserved_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg=demo_config(ROOT);legacy=copy.deepcopy(cfg)
+            current=next(x for x in cfg['splunk_sources'] if x['id']=='shipment_dep')
+            old=next(x for x in legacy['splunk_sources'] if x['id']=='shipment_dep')
+            old['fields']['customer_key']='OLD_CUSTOMER'
+            db=Database(Path(td)/'legacy.sqlite',ROOT);db.initialize(legacy)
+            at=now_kst().replace(microsecond=0)-timedelta(minutes=5)
+            e=event(old,key='SHIP1',at=at,OLD_CUSTOMER='OLD-CUST',CUSTOMER='NEW-CUST')
+            db.ingest(old,[e],int(time.time())-10,month_start_epoch())
+            self.assertEqual(db.query('SELECT customer_key FROM shipment_current')[0]['customer_key'],'OLD-CUST')
+            db.initialize(cfg)
+            row=db.query('SELECT customer_key FROM shipment_current')[0]
+            self.assertEqual(row['customer_key'],'NEW-CUST')
+            self.assertEqual(db.state('shipment_dep')['config_hash'],source_fingerprint(current))
+            self.assertIn('PAYLOAD_REMAP',db.state('shipment_dep')['projection_note'])
+    def test_metadata_only_legacy_hash_rebases_without_payload_rewrite(self):
+        d=next(x for x in self.cfg['splunk_sources'] if x['id']=='shipment_dep')
+        self.ingest([event(d,key='SHIPMETA',at=self.at)],d)
+        legacy=copy.deepcopy(d);legacy.pop('inventory_semantics_confirmed',None);legacy.pop('allow_payload_migration',None)
+        with self.db.transaction() as con:
+            con.execute('UPDATE source_state SET config_hash=? WHERE source_id=?',(legacy_source_fingerprint(legacy),d['id']))
+        self.db.initialize(self.cfg)
+        self.assertEqual(self.db.state(d['id'])['config_hash'],source_fingerprint(d))
+        self.assertEqual(self.db.state(d['id'])['projection_note'],'FINGERPRINT_METADATA_REBASE')
+    def test_payload_migration_rejects_business_key_change(self):
+        d=next(x for x in self.cfg['splunk_sources'] if x['id']=='shipment_dep')
+        self.ingest([event(d,key='SHIPKEY',at=self.at)],d)
+        changed=copy.deepcopy(self.cfg)
+        x=next(x for x in changed['splunk_sources'] if x['id']=='shipment_dep');x['key_fields']=['ITEMNO']
+        with self.assertRaises(ConfigError):self.db.initialize(changed)
     def test_latest_row_full(self):
         first=event(self.d,key='1',qty='100',at=self.at,PALLET='old')
         last=event(self.d,key='1',qty='200',at=self.at,changed=self.at+timedelta(minutes=5),PALLET='')
