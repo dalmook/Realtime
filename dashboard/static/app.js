@@ -343,7 +343,7 @@
     renderFilters();renderFilterChips();renderKPI(animate);renderRanking();renderNotes();renderEvents();renderProgress();renderTable('inboundTable');renderTable('shipmentTable');renderCharts();renderStatus();
   }
   function goView(view,updateHash=true){
-    if(!VIEWS.includes(view))return;state.view=view;document.body.dataset.view=view;
+    if(!VIEWS.includes(view))return;const changed=state.view!==view;state.view=view;document.body.dataset.view=view;
     VIEWS.forEach(v=>$('#'+v+'View').hidden=v!==view);
     $$('.primary-nav [data-view]').forEach(b=>{const yes=b.dataset.view===view;b.classList.toggle('active',yes);yes?b.setAttribute('aria-current','page'):b.removeAttribute('aria-current');});
     $('#pageTitle').textContent=TITLES[view];$('#pageNumber').textContent=`0${VIEWS.indexOf(view)+1} / 0${VIEWS.length}`;
@@ -352,6 +352,7 @@
     renderCharts();markErrors();requestAnimationFrame(fitNumbers);
     if(updateHash)window.scrollTo({top:0,behavior:'instant'});
     if(view==='targets'&&window.SCMTargets&&typeof window.SCMTargets.load==='function')window.SCMTargets.load();
+    if(updateHash&&changed&&state.statuses.kpi?.data)setTimeout(()=>refresh(true),0);
   }
   function stepView(delta){goView(VIEWS[(VIEWS.indexOf(state.view)+delta+VIEWS.length)%VIEWS.length]);}
   function paramsFor(endpoint,snapshot,metricOverride){
