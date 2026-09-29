@@ -26,7 +26,7 @@ def demo_config(root):
     for d in cfg['oracle_sources']:
         m=d['mapping']; m['confirmed']=True
         m['filters']={};m.pop('row_key_fields',None);m.pop('query_file',None);d['query_file']=None
-        if d['kind']=='conversion': m['fields']={'material':'ITEM','period_ym':'YM','unit':{'value':'PC'},'eq_per_unit':'FACTOR'}
+        if d['kind']=='conversion': m['fields']={'material':'ITEM','period_ym':'YM','conv_code':'CONV_CODE','eq_per_unit':'CONVEQQTY'}
         elif d['kind']=='customer': m['fields']={'customer_key':'CODE','customer_name':'NAME','customer_group':'GROUP_NAME'}
         elif d['kind'].endswith('_plan'):
             m['fields']={'period_ym':'YM','plan_version':'VERSION'}
@@ -40,7 +40,8 @@ def fake_tables(period=None):
     period=period or now_kst().strftime('%Y%m')
     return {
       'product':[{'ITEM':'DEMO_A','PRODUCT':'예시 제품 A','PRODUCTGROUP':'예시 DRAM'},{'ITEM':'DEMO_B','PRODUCT':'예시 제품 B','PRODUCTGROUP':'예시 NAND'}],
-      'conversion':[{'ITEM':'DEMO_A','YM':period,'FACTOR':'2'},{'ITEM':'DEMO_B','YM':period,'FACTOR':'0.5'}],
+      'conversion':[{'ITEM':'DEMO_A','YM':period,'CONV_CODE':'K4-DEMO','CONVEQQTY':'2'},
+                    {'ITEM':'DEMO_B','YM':period,'CONV_CODE':'K9-DEMO','CONVEQQTY':'0.5'}],
       'customer':[{'CODE':'C01','NAME':'예시 거래선','GROUP_NAME':'예시 조직'}],
       'inbound_plan':[{'YM':period,'ITEM':'DEMO_A','PLANT':'P1M1','VERSION':'CONFIRMED','TARGET_BOX':'10','TARGET_EA':'2000'},
                       {'YM':period,'ITEM':'DEMO_B','PLANT':'P1M1','VERSION':'CONFIRMED','TARGET_BOX':'5','TARGET_EA':'1000'}],
