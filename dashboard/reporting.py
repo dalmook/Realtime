@@ -101,16 +101,22 @@ def cte(direction,metric,limit_start=False,limit_end=False):
     if metric not in METRICS: raise ValueError('invalid metric')
     table='shipment_box_current' if direction=='shipment' and metric=='BOX' else direction+'_current'
     shipment=direction=='shipment' and metric!='BOX'
-    # Restrict the expensive latest-amount window to the reporting period whenever possible.
-    amount_where=''
-    if shipment:
+    # Restrict the expensive amount window by shipment business keys, not amount dates.
+    # This keeps cross-date billing matches valid while avoiding a full history window scan.
+    if shipment and (limit_start or limit_end):
         clauses=[]
         if limit_start: clauses.append('business_date>=:cte_start')
         if limit_end: clauses.append('business_date<=:cte_end')
-        if clauses: amount_where=' WHERE '+' AND '.join(clauses)
-    amount_cte=(f"""WITH am AS (
-      SELECT *,ROW_NUMBER() OVER(PARTITION BY record_key ORDER BY modified_us DESC,generated_us DESC,indexed_us DESC,source_id) rn
-      FROM shipment_amount_current{amount_where}), """ if shipment else 'WITH ')
+        key_where=' WHERE '+' AND '.join(clauses)
+        amount_cte=f"""WITH report_keys AS (
+          SELECT DISTINCT record_key FROM {table}{key_where}
+        ), am AS (
+          SELECT a.*,ROW_NUMBER() OVER(PARTITION BY a.record_key ORDER BY a.modified_us DESC,a.generated_us DESC,a.indexed_us DESC,a.source_id) rn
+          FROM shipment_amount_current a JOIN report_keys q ON q.record_key=a.record_key), """
+    else:
+        amount_cte="""WITH am AS (
+          SELECT *,ROW_NUMBER() OVER(PARTITION BY record_key ORDER BY modified_us DESC,generated_us DESC,indexed_us DESC,source_id) rn
+          FROM shipment_amount_current), """ if shipment else 'WITH '
     joins=''
     customer="COALESCE(NULLIF(f.customer_key,''),'')"
     customer_name="COALESCE(NULLIF(c.customer_name,''),NULLIF(f.customer_key,''),'미분류')"
