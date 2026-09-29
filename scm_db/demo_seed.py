@@ -26,7 +26,11 @@ def seed(settings,at=None):
             mat=f'DEMO-{i:03}-MEMORY';family='DRAM' if i%2 else 'FLASH';cust=f'DEMO-C{(i-1)%8+1:02}'
             materials.append((mat,family,cust))
             c.execute('INSERT INTO dim_product VALUES(?,?,?,?,?)',(mat,f'예시 {family} {i:02}',family,'product','demo'))
-            c.execute('INSERT INTO dim_conversion VALUES(?,?,?,?,?,?)',('',mat,'PC-'+family,str(1.25 if family=='DRAM' else 4.5),'conversion','demo'))
+            factor=1.25 if family=='DRAM' else 4.5
+            code=('K4' if family=='DRAM' else 'K9')+f'-DEMO-{i:03}'
+            c.execute('INSERT INTO dim_conversion_component VALUES(?,?,?,?,?,?,?)',('',mat,code,family,str(factor),'conversion','demo'))
+            if i==1:
+                c.execute('INSERT INTO dim_conversion_component VALUES(?,?,?,?,?,?,?)',('',mat,'K9-DEMO-COMBO','FLASH','0.75','conversion','demo'))
             for direction,ps in [('inbound','inbound_plan'),('shipment','shipment_plan')]:
                 for metric,value in [('EA',950000+i*15000)]+([('USD',(950000+i*15000)*(2+i*.13))] if direction=='shipment' else []):
                     c.execute('INSERT INTO plan_monthly VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
