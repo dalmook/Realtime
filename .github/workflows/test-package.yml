@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: 132 tests using synthetic data and mocked company connectors
+      - name: 140 tests using synthetic data and mocked company connectors
         run: python -S -m unittest discover -s tests -v
       - name: Launch real demo process and verify local HTTP endpoints
         run: python -S tools/smoke_launcher.py
@@ -44,7 +44,7 @@ jobs:
           python tools/build_site.py
           python - <<'PY'
           import json,os,pathlib
-          pathlib.Path('docs/BUILD_INFO.json').write_text(json.dumps({'commit':os.environ['GITHUB_SHA'],'run':os.environ['GITHUB_RUN_ID'],'tests':'132 unit tests and real launcher HTTP smoke; Ubuntu/Windows; Python 3.11/3.13','company_connections_tested':False},indent=2)+'\n')
+          pathlib.Path('docs/BUILD_INFO.json').write_text(json.dumps({'commit':os.environ['GITHUB_SHA'],'run':os.environ['GITHUB_RUN_ID'],'tests':'140 unit tests and real launcher HTTP smoke; Ubuntu/Windows; Python 3.11/3.13','company_connections_tested':False},indent=2)+'\n')
           PY
           python tools/build_package.py --output release/SCMRealtimeDB_portable.zip
           cp site/index.html release/SCM_Demo.html
@@ -63,7 +63,7 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release/* --clobber
           else
-            gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Realtime ${VERSION}" --notes "Verified source package and synthetic demo. Linux/Windows Python 3.11/3.13 tests passed. Company credentials, databases and Oracle binaries are excluded. Company: configure .env then START.cmd; synthetic demo: DEMO.cmd or SCM_Demo.html." --latest
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Realtime ${VERSION}" --notes "Verified portable package. Linux/Windows Python 3.11/3.13 tests and real demo HTTP smoke passed. Conversion rule: MATNR=ITEM, CONV_CODE components, QTY*CONVEQQTY; raw EA/BOX/USD remain single-counted. Company: SETUP -> .env -> CHECK -> SYNC_ORACLE -> VERIFY_CONVERSION -> START. Credentials, databases and Oracle binaries are excluded." --latest
           fi
           echo "Release: https://github.com/${GH_REPO}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"
   pages:

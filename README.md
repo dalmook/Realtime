@@ -25,10 +25,15 @@ python run.py demo
 
 ## 회사에서 실행
 
-1. ZIP을 새 폴더에 압축 해제합니다. 기존 코드/DB를 덮어쓰지 않는 방식이 안전합니다.
-2. `SETUP.cmd`를 실행합니다. 이미 있는 `.env`는 보존하며, 없을 때만 예제를 복사합니다.
-3. 생성된 `.env`에 회사 승인 연결 정보를 입력하고 `CHECK.cmd`로 준비 상태를 확인합니다.
-4. `START.cmd`를 실행합니다. API와 수집기가 함께 실행되고 브라우저가 열립니다.
+1. ZIP을 **새 폴더**에 압축 해제합니다. 기존 코드/DB를 덮어쓰지 않는 방식이 안전합니다.
+2. `SETUP.cmd`를 실행합니다. Python 선택, `.env` 준비, 로컬 DB 스키마 준비만 수행합니다.
+3. 생성된 `.env`에 회사 승인 Splunk/Oracle 연결 정보를 입력합니다.
+4. `CHECK.cmd`로 Python·SQLite·Oracle Thick 준비 상태를 확인합니다.
+5. **이번 MATNR/환산 변경판을 처음 적용할 때는 `SYNC_ORACLE.cmd`를 1회 실행**하여 `ITEM / CONV_CODE / CONVEQQTY` 기준정보를 다시 적재합니다.
+6. `VERIFY_CONVERSION.cmd`에서 실제 MATNR 하나를 넣어 DRAM/FLASH 환산계수를 확인합니다.
+7. `START.cmd`를 실행합니다. API와 수집기가 함께 실행되고 브라우저가 열립니다.
+
+상세 체크리스트는 [로컬 실행 작업지시서](docs/LOCAL_RUN_WORK_INSTRUCTION_KO.md)를 따르세요.
 
 기존 Python을 지정하려면 실행 전 `PYTHON_EXE`에 전체 python.exe 경로를 설정하거나 `SELECT_PYTHON.cmd`를 사용합니다.
 Oracle을 쓰려면 선택한 Python에 `oracledb` 또는 `cx_Oracle` 드라이버와 호환 Instant Client가 **미리 설치**되어 있어야 합니다.
@@ -60,9 +65,11 @@ Oracle을 쓰려면 선택한 Python에 `oracledb` 또는 `cx_Oracle` 드라이�
 - 실행 코드 폴더와 DB 폴더가 분리되어 ZIP 교체만으로 DB가 삭제되지 않습니다.
 - `DATA_DIR`은 네트워크 공유 드라이브가 아닌 로컬 디스크로 지정합니다.
 - 업데이트 전 수집기를 종료하고 `BACKUP.cmd`로 SQLite 일관성 백업을 수행합니다.
-- 새 ZIP을 **새 폴더**에 해제하고 `.env`와 필요한 로컬 설정만 복사합니다. 새 폴더에서 `START.cmd`를 실행합니다.
-- 공급되는 새 config/pipeline.json과 회사에서 수정한 로컬 매핑은 비교 후 반영합니다. 키·매핑이 달라지면 지문 검사가 중단합니다. DB 전체 리셋으로 우회하지 마세요.
-- 기존 테이블/행을 지우는 자동 마이그레이션은 없습니다. 추가 컬럼 마이그레이션과 실행 전 백업을 사용합니다.
+- 새 ZIP을 **새 폴더**에 해제하고 `.env`와 필요한 로컬 설정만 복사합니다.
+- 이번 버전은 입고 자재 연결키를 `P_CODE → MATNR`로 바꿉니다. 기존 DB의 원문 JSON에 MATNR가 모두 있으면 최초 초기화 때 자동 이관하며, 이관 전 DB 백업을 만듭니다.
+- 기존 행 중 MATNR가 하나라도 없으면 자동 이관을 중단합니다. **DB 삭제/reset-source로 우회하지 말고** 오류 내용을 보존한 뒤 backfill 방법을 결정하세요.
+- 이전 `EQQTY/unit` 환산 결과는 신뢰하지 않고 무효화합니다. 새 코드 최초 적용 후 `SYNC_ORACLE.cmd`로 Oracle conversion을 다시 읽어야 합니다.
+- 공급되는 새 `config/pipeline.json`과 회사에서 수정한 로컬 매핑은 비교 후 반영합니다. 다른 키·매핑 변경은 계속 지문 검사로 차단합니다.
 
 ## 프로젝트 구조
 
@@ -82,7 +89,7 @@ SCMRealtimeDB/
 │   ├── focus_manager.py          집중관리 CRUD
 │   └── static/                   기존 화면 디자인 + 데모/관리 UI
 ├── sql/                          DB 스키마와 호환 조회 뷰
-├── tests/                        외부 연결 없는 132개 테스트
+├── tests/                        외부 연결 없는 140개 테스트
 ├── tools/build_site.py           합성 단일 HTML 생성
 ├── tools/build_package.py        허용 목록 기반 ZIP 생성
 ├── tools/publish_github.py       Realtime 저장소 / 다운로드 안내
@@ -101,6 +108,24 @@ SCMRealtimeDB/
 없는 `c_id/i_type` 컬럼 대신 원본 JSON 조회, 연속 수집 KZWI3 우선 연결,
 수기 목표 UI/API 필드 통일, 동일 범위에만 수기 목표 우선 적용,
 조회 오류를 0으로 숨기지 않기, EQ의 일대다 JOIN으로 EA가 늘어나는 문제 차단입니다.
+
+## 환산 규칙
+
+현재 확정한 공통 환산 규칙은 다음과 같습니다.
+
+- 실적 ITEM 연결키: **Splunk `MATNR` ↔ Oracle `SCM_INFO.SCM_FABIN_CONV_FAM6_MST_M.ITEM`**
+- 구성 분리키: `CONV_CODE`
+- 환산계수: `CONVEQQTY`
+- 환산식: **원본 QTY × CONVEQQTY**
+- `CONV_CODE K4*`, `PD*` → DRAM
+- `CONV_CODE K9*` → FLASH
+- 그 외 → OTHER
+
+한 ITEM에 DRAM과 FLASH 구성행이 같이 있어도 환산 구성만 여러 행으로 보존합니다. EA/QTY·BOX·USD 원본 fact는 한 번만 집계합니다.
+예를 들어 QTY=100, DRAM CONVEQQTY=2, FLASH CONVEQQTY=3이면 DRAM EQ=200, FLASH EQ=300이며 QTY=100/BOX/USD는 그대로입니다.
+이 로직은 `fact_valuation`에서 독립적으로 수행하여 입고·출하·재고가 같은 환산마스터를 사용합니다.
+
+로컬 확인은 `VERIFY_CONVERSION.cmd`를 실행해 실제 MATNR 하나를 입력하세요.
 
 ## 수치 계약
 
@@ -141,6 +166,8 @@ API 성공이 Splunk 수집 완료 또는 SAP 정합성 확인을 뜻하지 않�
 
 ```text
 SELFTEST.cmd
+SYNC_ORACLE.cmd
+VERIFY_CONVERSION.cmd
 python -S -m unittest discover -s tests -v
 python tools/build_site.py
 python tools/build_package.py

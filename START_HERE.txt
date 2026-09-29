@@ -1,22 +1,34 @@
-SCMRealtimeDB Portable 1.2.0
-==========================
+SCMRealtimeDB Portable 1.2.3-realtime
+===================================
 
-화면부터 확인: site/index.html을 브라우저에서 여세요. 완전 합성 데이터입니다.
-실제 로컬 API 데모: DEMO.cmd. Python 3.11+만 필요합니다.
+가장 먼저 읽기:
+  docs\LOCAL_RUN_WORK_INSTRUCTION_KO.md
 
-회사 실행:
-1. 새 폴더에 압축 해제.
-2. SETUP.cmd 실행 (기존 .env는 보존).
-3. .env의 회사 승인 연결 정보를 입력하고 CHECK.cmd.
-4. START.cmd 실행. http://127.0.0.1:8765/ 자동 열기.
+화면만 확인:
+  site\index.html       - Python 불필요, 완전 합성 데이터
+  DEMO.cmd              - 별도 합성 SQLite + 실제 Python API
 
-Oracle은 별도 설치된 드라이버와 Thick Instant Client가 필요합니다.
-자동 패키지 다운로드 / 보안정책 변경은 하지 않습니다.
-실제 DB는 코드 폴더 밖 LOCALAPPDATA/SCMRealtimeDB/live에 저장합니다.
-기존 DB 삭제나 reset-source로 오류를 우회하지 마세요.
-회사 서버 실접속 / SAP 정합성 / Windows 실기동은 이번 환경에서 검증하지 못했습니다.
+회사 로컬 실행:
+  1. 새 폴더에 ZIP 압축 해제
+  2. SETUP.cmd
+  3. .env에 승인된 Splunk / Oracle 정보 입력
+  4. CHECK.cmd
+  5. SYNC_ORACLE.cmd        [이번 환산 변경판 최초 1회 필수]
+  6. VERIFY_CONVERSION.cmd  [실제 MATNR 하나로 환산 확인]
+  7. START.cmd
 
-GitHub 게시 상태: 이번 작업에서는 신규 repo 생성과 Pages 게시가 완료되지 않았습니다.
-PUBLISH_GITHUB.cmd는 사용자 PC의 인증된 GitHub CLI로 처음 게시하는 별도 도구입니다.
-소스 비공개 repo + 합성 데이터 공개 demo repo를 생성하며 동명 repo는 덮어쓰지 않습니다.
-상세 사항: README.md와 docs/RESTORATION.md.
+환산 기준:
+  Splunk MATNR = Oracle ITEM
+  CONV_CODE로 DRAM/FLASH 구성 분리
+  환산수량 = QTY * CONVEQQTY
+  K4*/PD* = DRAM, K9* = FLASH
+  환산 구성은 여러 행이어도 EA/QTY, BOX, USD 원본값은 중복 집계하지 않음
+
+기존 DB:
+  기본 위치 %LOCALAPPDATA%\SCMRealtimeDB\live\scm_live.sqlite
+  예전 P_CODE 기반 DB는 원문 MATNR가 모두 있을 때만 안전하게 1회 이관
+  MATNR 누락 오류가 나면 DB 삭제/reset-source로 우회하지 말 것
+  예전 EQQTY 환산값은 무효화되므로 SYNC_ORACLE.cmd 성공이 필요
+
+Python 3.11+ / Oracle Thick + 승인된 Instant Client 필요.
+자동 PyPI 다운로드나 회사 보안 설정 변경은 하지 않습니다.

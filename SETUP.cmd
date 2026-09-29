@@ -11,9 +11,12 @@ call "%~dp0_python.cmd"
 if errorlevel 1 goto failed
 "%SCM_PYTHON%" run.py init
 if errorlevel 1 goto failed
-"%SCM_PYTHON%" run.py doctor
 echo.
-echo SETUP DONE. Fill .env with approved company settings, then run START.cmd.
+echo SETUP DONE.
+echo 1. Fill .env with approved company settings.
+echo 2. Run CHECK.cmd.
+echo 3. Run SYNC_ORACLE.cmd once for the MATNR / CONV_CODE / CONVEQQTY conversion model.
+echo 4. Run VERIFY_CONVERSION.cmd, then START.cmd.
 echo DEMO.cmd works without Oracle/Splunk and uses a SEPARATE synthetic database.
 echo No packages were downloaded or installed.
 pause
