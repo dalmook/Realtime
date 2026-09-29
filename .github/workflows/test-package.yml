@@ -1,0 +1,96 @@
+name: Verify, package and deploy Realtime
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: realtime-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 132 tests using synthetic data and mocked company connectors
+        run: python -S -m unittest discover -s tests -v
+      - name: Launch real demo process and verify local HTTP endpoints
+        run: python -S tools/smoke_launcher.py
+  package:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Generate standalone synthetic demo and safe ZIP
+        run: |
+          python tools/build_site.py
+          python - <<'PY'
+          import json,os,pathlib
+          pathlib.Path('docs/BUILD_INFO.json').write_text(json.dumps({'commit':os.environ['GITHUB_SHA'],'run':os.environ['GITHUB_RUN_ID'],'tests':'132 unit tests and real launcher HTTP smoke; Ubuntu/Windows; Python 3.11/3.13','company_connections_tested':False},indent=2)+'\n')
+          PY
+          python tools/build_package.py --output release/SCMRealtimeDB_portable.zip
+          cp site/index.html release/SCM_Demo.html
+          sha256sum release/SCMRealtimeDB_portable.zip release/SCM_Demo.html > release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Realtime-verified-downloads
+          path: release/
+      - name: Publish verified commit as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION=$(tr -d '\r\n' < VERSION)
+          TAG="v${VERSION}-${GITHUB_SHA:0:7}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Realtime ${VERSION}" --notes "Verified source package and synthetic demo. Linux/Windows Python 3.11/3.13 tests passed. Company credentials, databases and Oracle binaries are excluded. Company: configure .env then START.cmd; synthetic demo: DEMO.cmd or SCM_Demo.html." --latest
+          fi
+          echo "Release: https://github.com/${GH_REPO}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"
+  pages:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python tools/build_site.py
+      - name: Configure synthetic-only GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Deploy synthetic-only page
+        id: deployment
+        uses: actions/deploy-pages@v4
