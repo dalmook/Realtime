@@ -1,4 +1,4 @@
-SCMRealtimeDB Portable 1.2.3-realtime
+SCMRealtimeDB Portable 1.2.4-realtime
 ===================================
 
 가장 먼저 읽기:

@@ -62,7 +62,8 @@
         "ACCOUNT는 거래선키로 확인되지 않았으므로 customer_key에 자동 매핑하지 않음.",
         "I_FLAG/T_FLAG/D_FLAG는 의미가 확인되지 않아 취소조건으로 임의 사용하지 않음.",
         "환산/제품 연결키는 Splunk MATNR ↔ Oracle ITEM. 기존 P_CODE 연결은 사용하지 않음."
-      ]
+      ],
+      "allow_payload_migration": true
     },
     {
       "id": "inventory_dep",
@@ -161,7 +162,8 @@
         "FKDAT_ANA=청구일자(business_date), ERDAT+ERZET=생성일시(버전판정), KUNAG_ANA=고객코드.",
         "KURSK=환율(1.0 또는 1384.30 — 통화쌍에 따라 상이). MEINS=단위(기본 EA).",
         "박스수는 ZSVLEG52010.DELIVERY=VGBEL 조인으로 별도 집계(COUNT DISTINCT CARTON)."
-      ]
+      ],
+      "allow_payload_migration": true
     },
     {
       "id": "shipment_box_dep",
@@ -216,7 +218,8 @@
         "CARTON=카톤 번호. qty_i에 CARTON값을 저장하여 SUM(qty_i)으로 박스수 집계.",
         "PLANT=P1M1 필터. 제외창고(63D0/63J0/63P0/13H0)는 서버 조회 단계에서 필터.",
         "DELIVERY=VBRP.VGBEL(DO번호) 조인 키. SD_DATE=출하일자."
-      ]
+      ],
+      "allow_payload_migration": true
     },
     {
       "id": "shipment_amount_dep",
@@ -272,7 +275,8 @@
         "WAERK=통화(KRW/USD). KZWI3는 WAERK와 무관하게 USD 금액으로 사용.",
         "business_date=FKDAT(청구일자), business_time=ERZET(청구시간).",
         "plant=WERKS, warehouse=LGORT, customer_key=KUNAG."
-      ]
+      ],
+      "allow_payload_migration": true
     }
   ],
   "oracle_sources": [

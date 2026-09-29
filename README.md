@@ -89,7 +89,7 @@ SCMRealtimeDB/
 │   ├── focus_manager.py          집중관리 CRUD
 │   └── static/                   기존 화면 디자인 + 데모/관리 UI
 ├── sql/                          DB 스키마와 호환 조회 뷰
-├── tests/                        외부 연결 없는 140개 테스트
+├── tests/                        외부 연결 없는 144개 테스트
 ├── tools/build_site.py           합성 단일 HTML 생성
 ├── tools/build_package.py        허용 목록 기반 ZIP 생성
 ├── tools/publish_github.py       Realtime 저장소 / 다운로드 안내
