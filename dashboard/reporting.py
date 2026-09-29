@@ -280,16 +280,16 @@ def system_target(con,direction,metric,ym,filters):
     for r in rows:
         value=r['target_i']/SCALE
         if metric.startswith('EQ_'):
-            unit='PC-DRAM' if metric=='EQ_DRAM' else 'PC-FLASH'
-            coeff=con.execute("""SELECT eq_per_unit FROM dim_conversion c WHERE material=? AND unit=? AND period_ym IN (?,'')
+            family='DRAM' if metric=='EQ_DRAM' else 'FLASH'
+            comps=con.execute("""SELECT material,conv_code,conv_family,eq_per_unit,period_ym
+             FROM dim_conversion_component c WHERE material IN (?,?) AND period_ym IN (?,'')
              AND EXISTS(SELECT 1 FROM reference_state rs WHERE rs.source_id=c.reference_source AND rs.projection_ready=1)
-             ORDER BY period_ym DESC LIMIT 1""",(r['material'][:18],unit,ym)).fetchone()
-            # A mapped material belonging to the other family legitimately contributes zero.
-            if not coeff:
-                other=con.execute("SELECT 1 FROM dim_conversion WHERE material=? AND period_ym IN (?,'')",(r['material'][:18],ym)).fetchone()
-                if not other:return None,'목표 환산 마스터 누락'
-                value=0
-            else:value*=float(coeff['eq_per_unit'])
+             ORDER BY (material=?) DESC,(period_ym=?) DESC,conv_code""",
+             (r['material'],r['material'][:18],ym,r['material'],ym)).fetchall()
+            chosen={}
+            for comp in comps: chosen.setdefault(comp['conv_code'],comp)
+            if not chosen:return None,'목표 환산 마스터 누락'
+            value*=sum(float(x['eq_per_unit']) for x in chosen.values() if x['conv_family']==family)
         total+=value
     return total,'Oracle plan_monthly'
 
