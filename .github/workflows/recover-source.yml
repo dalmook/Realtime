@@ -1,0 +1,62 @@
+name: Recover interrupted source upload
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/recover-source.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect compressed source without executing it
+        run: |
+          python - <<'PY'
+          import base64, hashlib, io, lzma, pathlib, tarfile
+          root = pathlib.Path.cwd()
+          paths = [root / '.import/part-001.b64'] + sorted((root / '.import').glob('segment-*.b64'))
+          text = b''.join(p.read_bytes().strip() for p in paths)
+          print('PARTS', [(p.name, p.stat().st_size) for p in paths])
+          print('BASE64_LENGTH', len(text))
+          raw = base64.b64decode(text + b'=' * (-len(text) % 4), validate=False)
+          print('COMPRESSED_LENGTH', len(raw), 'HEADER', raw[:16].hex())
+          out = bytearray()
+          decoder = lzma.LZMADecompressor()
+          for offset in range(0, len(raw), 32):
+              try:
+                  out.extend(decoder.decompress(raw[offset:offset+32]))
+              except (lzma.LZMAError, EOFError) as exc:
+                  print('DECOMPRESS_STOP', offset, type(exc).__name__)
+                  break
+              if decoder.eof:
+                  print('COMPLETE_XZ', offset + 32)
+                  break
+          print('TAR_BYTES', len(out))
+          recovered = root / 'recovered'
+          recovered.mkdir(exist_ok=True)
+          count = 0
+          try:
+              with tarfile.open(fileobj=io.BytesIO(out), mode='r:') as archive:
+                  for entry in archive:
+                      p = pathlib.PurePosixPath(entry.name)
+                      if p.is_absolute() or '..' in p.parts or not entry.isfile() or entry.size > 5000000:
+                          continue
+                      data = archive.extractfile(entry).read()
+                      if len(data) != entry.size:
+                          break
+                      dest = recovered / p
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      dest.write_bytes(data)
+                      print('FILE', entry.name, len(data), hashlib.sha256(data).hexdigest())
+                      count += 1
+          except (tarfile.TarError, EOFError, OSError) as exc:
+              print('TAR_STOP', type(exc).__name__)
+          print('RECOVERED_FILES', count)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovered-source-inspection
+          path: recovered
+          include-hidden-files: true
