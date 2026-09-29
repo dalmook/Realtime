@@ -1,5 +1,5 @@
 from __future__ import annotations
-import contextlib, json, sqlite3, time, uuid
+import contextlib, copy, json, sqlite3, time, uuid
 from decimal import Decimal
 from pathlib import Path
 from .common import *
@@ -53,7 +53,8 @@ class Database:
                 versions=[x[0] for x in con.execute('SELECT version FROM schema_version')]
             if versions and max(versions)>1: raise ConfigError('이 프로그램보다 새로운 DB입니다. 덮어쓰지 않습니다')
             con.execute('PRAGMA journal_mode='+choose_journal())
-            # Backup only when an existing DB actually needs an ALTER migration.
+            had_component=bool(con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dim_conversion_component'").fetchone())
+            material_remaps=[]
             migration_needed=False
             if versions:
                 if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fact_valuation'").fetchone():
@@ -63,6 +64,16 @@ class Database:
                     table=domain+'_current'
                     if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
                         migration_needed=migration_needed or 'amount_i' not in {r[1] for r in con.execute(f'PRAGMA table_info({table})')}
+                if not had_component:migration_needed=True
+                if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_state'").fetchone():
+                    for d in config['splunk_sources']:
+                        old=con.execute('SELECT * FROM source_state WHERE source_id=?',(d['id'],)).fetchone()
+                        if not old or old['config_hash']==source_fingerprint(d) or not old['watermark']: continue
+                        legacy=copy.deepcopy(d)
+                        if d['id']=='inbound_dep' and d.get('fields',{}).get('material')=='MATNR':
+                            legacy['fields']['material']='P_CODE'
+                            if old['config_hash']==source_fingerprint(legacy):
+                                material_remaps.append(d['id']);migration_needed=True
             if migration_needed:self.backup()
             con.executescript((self.root/'sql/001_schema.sql').read_text(encoding='utf-8'))
             existing={r[1] for r in con.execute('PRAGMA table_info(fact_valuation)')}
@@ -79,10 +90,18 @@ class Database:
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_record ON {table}(record_key)')
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_report ON {table}(plant,scope_ok,deleted,business_date)')
             con.execute('CREATE INDEX IF NOT EXISTS ix_shipment_amount_latest ON shipment_amount_current(record_key,modified_us DESC,generated_us DESC,indexed_us DESC,source_id)')
+            for source_id in material_remaps:
+                missing=con.execute("""SELECT COUNT(*) FROM inbound_current
+                  WHERE source_id=? AND COALESCE(TRIM(CAST(json_extract(payload_json,'$.MATNR') AS TEXT)),'')=''""",(source_id,)).fetchone()[0]
+                if missing:
+                    raise ConfigError(f'{source_id}: 기존 {missing}행에 MATNR가 없어 P_CODE→MATNR 자동이관을 중단합니다. 원천 backfill/reset이 필요합니다')
+                con.execute("""UPDATE inbound_current SET material=TRIM(CAST(json_extract(payload_json,'$.MATNR') AS TEXT))
+                  WHERE source_id=?""",(source_id,))
+                con.execute('DELETE FROM fact_valuation WHERE source_id=?',(source_id,))
             for d in config['splunk_sources']:
                 h=source_fingerprint(d)
                 old=con.execute('SELECT * FROM source_state WHERE source_id=?',(d['id'],)).fetchone()
-                if old and old['config_hash']!=h and old['watermark']:
+                if old and old['config_hash']!=h and old['watermark'] and d['id'] not in material_remaps:
                     raise ConfigError(f"{d['id']}: 원천/키/매핑 변경 감지. 중지 후 새 source id로 등록하거나 reset-source --confirm 실행하세요")
                 con.execute('''INSERT INTO source_state(source_id,domain,enabled,config_hash) VALUES(?,?,?,?)
                   ON CONFLICT(source_id) DO UPDATE SET enabled=excluded.enabled,config_hash=excluded.config_hash''',
@@ -90,6 +109,11 @@ class Database:
             for d in config['oracle_sources']:
                 con.execute('''INSERT INTO reference_state(source_id,oracle_table,kind) VALUES(?,?,?)
                  ON CONFLICT(source_id) DO UPDATE SET oracle_table=excluded.oracle_table,kind=excluded.kind''',(d['id'],d['table'],d['kind']))
+            if versions and not had_component:
+                con.execute("""UPDATE reference_state SET projection_ready=0,projection_note='CONVERSION_RESYNC_REQUIRED'
+                  WHERE source_id='conversion' AND snapshot_id IS NOT NULL""")
+                con.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='reference_revision'")
+            if material_remaps or (versions and not had_component):revalue_all(con)
             con.commit()
             con.executescript((self.root/'sql/002_views.sql').read_text(encoding='utf-8'))
         finally: con.close()
@@ -194,26 +218,24 @@ def source_fingerprint(d):
 
 def value_fact(con,r):
     rev=int(con.execute("SELECT value FROM meta WHERE key='reference_revision'").fetchone()[0])
-    rows=con.execute("""SELECT c.period_ym,c.unit,c.eq_per_unit FROM dim_conversion c
+    rows=con.execute("""SELECT c.period_ym,c.material,c.conv_code,c.conv_family,c.eq_per_unit
+       FROM dim_conversion_component c
        JOIN reference_state s ON s.source_id=c.reference_source AND s.projection_ready=1
        WHERE c.material IN (?,substr(?,1,18)) AND c.period_ym IN (?, '')
-       ORDER BY (c.material=?) DESC,c.period_ym DESC""",
-       (r['material'],r['material'],r['business_date'][:6],r['material'])).fetchall()
+       ORDER BY (c.material=?) DESC,(c.period_ym=?) DESC,c.conv_code""",
+       (r['material'],r['material'],r['business_date'][:6],r['material'],r['business_date'][:6])).fetchall()
     chosen={}
-    for row in rows: chosen.setdefault(row['unit'],row['eq_per_unit'])
-    eq=dram=flash=None; note='CONVERSION_UNMAPPED'
+    for row in rows: chosen.setdefault(row['conv_code'],row)
+    eq=dram=flash=None;note='CONVERSION_UNMAPPED'
     if r['unit'] not in ('PC','EA'):
         note='UNIT_MISMATCH'
     elif chosen:
-        eq=0
-        for unit, factor in chosen.items():
-            if unit not in ('PC','EA','PC-DRAM','PC-FLASH','PC-OTHER'): continue
-            v=scaled(Decimal(r['qty_i'])/SCALE*Decimal(factor),round_ok=True)
+        eq=0;dram=0;flash=0
+        for row in chosen.values():
+            v=scaled(Decimal(r['qty_i'])/SCALE*Decimal(row['eq_per_unit']),round_ok=True)
             eq+=v
-            if unit=='PC-DRAM': dram=v
-            if unit=='PC-FLASH': flash=v
-        if any(k.startswith('PC-') for k in chosen):
-            dram=dram if dram is not None else 0; flash=flash if flash is not None else 0
+            if row['conv_family']=='DRAM':dram+=v
+            elif row['conv_family']=='FLASH':flash+=v
         note='OK'
     con.execute("""INSERT INTO fact_valuation
      (source_id,record_key,event_hash,reference_revision,eq_i,eq_dram_i,eq_flash_i,note)
