@@ -46,12 +46,13 @@ def map_oracle(s,db,source_id):
     if kind=='product':
         for k,label in [('material','자재번호'),('product_name','제품명'),('product_group','제품군')]: f[k]=choose(cols,label,f.get(k))
     elif kind=='conversion':
-        f['material']=choose(cols,'자재 연결키 (Splunk MATNR과 연결되는 값)',f.get('material'))
+        f['material']=choose(cols,'Oracle ITEM (Splunk MATNR과 직접 연결)',f.get('material'))
         f['period_ym']=choose(cols,'환산 적용월 YYYYMM (월과 무관하면 = 입력)',f.get('period_ym'),True) or {'value':''}
-        f['unit']=choose(cols,'원본 단위 (현재 입고는 PC이므로 =PC)',f.get('unit'))
-        f['eq_per_unit']=choose(cols,'원본 수량 1개당 EQ 계수',f.get('eq_per_unit'))
-        mul=input('계수를 기본 EQ 단위로 바꾸는 배수 [1]: ').strip() or '1'; decimal(mul); m['factor_multiplier']=mul
-        if input('QTY × 계수 × 배수 = 기본 EQ 수량이 맞습니까? YES 입력: ').strip()!='YES': raise ConfigError('환산 산식 확인 전에는 활성화하지 않습니다')
+        f['conv_code']=choose(cols,'CONV_CODE (DRAM/FLASH 구성 분리키)',f.get('conv_code'))
+        f['eq_per_unit']=choose(cols,'CONVEQQTY (원수량 1개당 환산계수)',f.get('eq_per_unit'))
+        mul=input('CONVEQQTY 추가 배수 [1]: ').strip() or '1'; decimal(mul); m['factor_multiplier']=mul
+        print('현재 분류 규칙: CONV_CODE K4*/PD*=DRAM, K9*=FLASH, 그 외=OTHER')
+        if input('MATNR=ITEM, 환산수량=QTY×CONVEQQTY가 맞습니까? YES 입력: ').strip()!='YES': raise ConfigError('환산 산식 확인 전에는 활성화하지 않습니다')
     elif kind=='customer':
         f['customer_key']=choose(cols,'거래선 고유 연결키',f.get('customer_key'))
         f['customer_name']=choose(cols,'거래선명',f.get('customer_name'))
