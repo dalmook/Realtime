@@ -77,7 +77,9 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(read_sql(ROOT,{'table':'SCM_INFO.SCM_FABIN_CONV_FAM6_MST_M'}),'SELECT * FROM SCM_INFO.SCM_FABIN_CONV_FAM6_MST_M')
     def test_no_thin_fallback(self):
         module=MagicMock();module.is_thin_mode.return_value=True
-        with patch('scm_db.connectors.oracle._READY',None),patch('scm_db.connectors.oracle.driver_info',return_value=(module,'oracledb')):
+        # This is a mocked driver test, not an installed-OCI integration test.
+        # Mock only the file prerequisite; production must still reject Thin mode.
+        with patch('scm_db.connectors.oracle._READY',None),patch('scm_db.connectors.oracle.driver_info',return_value=(module,'oracledb')),patch('scm_db.connectors.oracle.Path.is_file',return_value=True):
             with self.assertRaises(ConfigError):prepare_driver(self.s)
             module.init_oracle_client.assert_called_once()
     def test_missing_driver_explained(self):
