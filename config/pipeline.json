@@ -42,7 +42,7 @@
       "fields": {
         "document_no": "CHIT",
         "box_no": "CHARG",
-        "material": "P_CODE",
+        "material": "MATNR",
         "quantity": "QTY",
         "unit": "UNIT",
         "plant": "PLANT",
@@ -60,7 +60,8 @@
         "PC는 원본 유지, 조회 표시 EA. BOX=선택 집합의 DISTINCT CHARG.",
         "PLANT/C_ID는 최신행 적재 후 범위판정. 원천 단계에 넣지 않아 범위 밖 변경도 반영.",
         "ACCOUNT는 거래선키로 확인되지 않았으므로 customer_key에 자동 매핑하지 않음.",
-        "I_FLAG/T_FLAG/D_FLAG는 의미가 확인되지 않아 취소조건으로 임의 사용하지 않음."
+        "I_FLAG/T_FLAG/D_FLAG는 의미가 확인되지 않아 취소조건으로 임의 사용하지 않음.",
+        "환산/제품 연결키는 Splunk MATNR ↔ Oracle ITEM. 기존 P_CODE 연결은 사용하지 않음."
       ]
     },
     {
@@ -290,8 +291,8 @@
           "period_ym": {
             "value": ""
           },
-          "unit": "UNIT",
-          "eq_per_unit": "EQQTY"
+          "conv_code": "CONV_CODE",
+          "eq_per_unit": "CONVEQQTY"
         },
         "filters": {
           "USE_FLAG": [

@@ -90,14 +90,24 @@ class DashboardTests(unittest.TestCase):
             row=c.execute('SELECT * FROM shipment_current LIMIT 1').fetchone();v,p=json.loads(row['record_key'])
             c.execute('INSERT INTO shipment_amount_kzwi3(vbeln,posnr,vgbel,matnr,kzwi3) VALUES(?,?,?,?,?)',(v,p,row['document_no'],row['material'],999999))
         self.assertEqual(before,r.kpi({'metric':'USD'})['shipment']['actual_mtd'])
-    def test_eq_conversion_does_not_duplicate_ea(self):
-        before=r.kpi({})['production']['actual_mtd']
-        with contextlib.closing(self.con(True)) as c,c:c.execute("INSERT INTO dim_conversion VALUES(?,?,?,?,?,?)",(self.ym,'DEMO-001-MEMORY','PC-DRAM','2.0','conversion','demo'))
-        self.assertEqual(before,r.kpi({})['production']['actual_mtd'])
-    def test_monthly_conversion_overrides_default(self):
+    def test_eq_conversion_does_not_duplicate_raw_measures(self):
+        before_ea=r.kpi({})['production']['actual_mtd']
+        before_box=r.kpi({'metric':'BOX'})['production']['actual_mtd']
+        before_usd=r.kpi({'metric':'USD'})['shipment']['actual_mtd']
+        with contextlib.closing(self.con(True)) as c,c:
+            c.execute("INSERT INTO dim_conversion_component VALUES(?,?,?,?,?,?,?)",(self.ym,'DEMO-001-MEMORY','K4-MONTH','DRAM','2.0','conversion','demo'))
+            c.execute("INSERT INTO dim_conversion_component VALUES(?,?,?,?,?,?,?)",(self.ym,'DEMO-001-MEMORY','K9-MONTH','FLASH','3.0','conversion','demo'))
+            for row in c.execute("SELECT * FROM inbound_current WHERE material='DEMO-001-MEMORY'").fetchall():value_fact(c,row)
+            for row in c.execute("SELECT * FROM shipment_current WHERE material='DEMO-001-MEMORY'").fetchall():value_fact(c,row)
+        self.assertEqual(before_ea,r.kpi({})['production']['actual_mtd'])
+        self.assertEqual(before_box,r.kpi({'metric':'BOX'})['production']['actual_mtd'])
+        self.assertEqual(before_usd,r.kpi({'metric':'USD'})['shipment']['actual_mtd'])
+        self.assertGreater(r.kpi({'metric':'EQ_DRAM'})['production']['actual_mtd'],0)
+        self.assertGreater(r.kpi({'metric':'EQ_FLASH'})['production']['actual_mtd'],0)
+    def test_monthly_conversion_overrides_default_per_conv_code(self):
         with contextlib.closing(self.con(True)) as c,c:
             row=c.execute("SELECT * FROM inbound_current WHERE material='DEMO-001-MEMORY' LIMIT 1").fetchone()
-            c.execute('INSERT INTO dim_conversion VALUES(?,?,?,?,?,?)',(self.ym,row['material'],'PC-DRAM','2.0','conversion','demo'))
+            c.execute('INSERT INTO dim_conversion_component VALUES(?,?,?,?,?,?,?)',(self.ym,row['material'],'K4-DEMO-001','DRAM','2.0','conversion','demo'))
             value_fact(c,row);v=c.execute('SELECT eq_dram_i FROM fact_valuation WHERE source_id=? AND record_key=?',(row['source_id'],row['record_key'])).fetchone()[0]
             self.assertEqual(v,row['qty_i']*2)
     def test_scope_leaving_row_excluded(self):

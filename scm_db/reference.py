@@ -6,6 +6,12 @@ from .database import revalue_all
 
 DIMENSIONS=('material','product_group','customer_key','plant','warehouse')
 
+def conversion_family(conv_code):
+    code=text(conv_code).upper()
+    if code.startswith(('K4','PD')): return 'DRAM'
+    if code.startswith('K9'): return 'FLASH'
+    return 'OTHER'
+
 def mapping_fields(spec):
     if isinstance(spec,str): return {spec}
     if isinstance(spec,dict) and 'year_field' in spec: return {spec['year_field'],spec['month_field']}
@@ -51,14 +57,13 @@ def project(con,d,snapshot_id,config):
             key=require(row,m['fields']['customer_key'],'거래선 키')
             value=(key,text(f('customer_name')),text(f('customer_group')),id,snapshot_id)
         elif kind=='conversion':
-            material=require(row,m['fields']['material'],'환산 자재')
+            material=require(row,m['fields']['material'],'환산 ITEM')
             period=text(f('period_ym')); period=ym(period) if period else ''
-            unit=text(f('unit','PC')).upper()
-            if not unit: raise DataError('환산 기준 단위 누락')
+            conv_code=require(row,m['fields']['conv_code'],'CONV_CODE')
             factor=decimal(f('eq_per_unit'))*decimal(m.get('factor_multiplier','1'))
-            if factor<0: raise DataError('환산계수가 음수입니다')
-            key=(period,material,unit)
-            value=(*key,str(factor),id,snapshot_id)
+            if factor<0: raise DataError('CONVEQQTY가 음수입니다')
+            key=(period,material,conv_code)
+            value=(*key,conversion_family(conv_code),str(factor),id,snapshot_id)
         else:
             period=ym(f('period_ym'))
             version=text(f('plan_version','BASE'))
@@ -91,10 +96,12 @@ def project(con,d,snapshot_id,config):
             raise DataError(f'{id}: 동일 키의 기준정보 값 충돌. MAX로 임의 선택하지 않습니다')
         records[key]=value; line_count+=1
     if not records and not d.get('allow_empty_projection',False): raise DataError(f'{id}: 매핑 후 0행. 이전 정규화 테이블 유지')
-    targets={'product':('dim_product',5),'customer':('dim_customer',5),'conversion':('dim_conversion',6),
+    targets={'product':('dim_product',5),'customer':('dim_customer',5),'conversion':('dim_conversion_component',7),
              'inbound_plan':('plan_monthly',15),'shipment_plan':('plan_monthly',15)}
     dest,n=targets[kind]
     con.execute(f'DELETE FROM {dest} WHERE reference_source=?',(id,))
+    if kind=='conversion':
+        con.execute('DELETE FROM dim_conversion WHERE reference_source=?',(id,))
     if records: con.executemany(f'INSERT INTO {dest} VALUES({",".join("?" for _ in range(n))})',records.values())
     if kind.endswith('_plan'):
         con.execute('DELETE FROM plan_actual_source WHERE plan_source=?',(id,))
