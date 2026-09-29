@@ -53,9 +53,17 @@ class Database:
                 versions=[x[0] for x in con.execute('SELECT version FROM schema_version')]
             if versions and max(versions)>1: raise ConfigError('이 프로그램보다 새로운 DB입니다. 덮어쓰지 않습니다')
             con.execute('PRAGMA journal_mode='+choose_journal())
-            # Capture a coherent backup before migrating a pre-existing database.
+            # Backup only when an existing DB actually needs an ALTER migration.
+            migration_needed=False
             if versions:
-                self.backup()
+                if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fact_valuation'").fetchone():
+                    fact_cols={r[1] for r in con.execute('PRAGMA table_info(fact_valuation)')}
+                    migration_needed=bool({'eq_dram_i','eq_flash_i'}-fact_cols)
+                for domain in DOMAINS:
+                    table=domain+'_current'
+                    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                        migration_needed=migration_needed or 'amount_i' not in {r[1] for r in con.execute(f'PRAGMA table_info({table})')}
+            if migration_needed:self.backup()
             con.executescript((self.root/'sql/001_schema.sql').read_text(encoding='utf-8'))
             existing={r[1] for r in con.execute('PRAGMA table_info(fact_valuation)')}
             for col in ('eq_dram_i','eq_flash_i'):
@@ -68,6 +76,9 @@ class Database:
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_date ON {table}(business_date,source_id,scope_ok,deleted)')
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_product ON {table}(material,business_date)')
                 con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_box ON {table}(box_no,business_date)')
+                con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_record ON {table}(record_key)')
+                con.execute(f'CREATE INDEX IF NOT EXISTS ix_{domain}_report ON {table}(plant,scope_ok,deleted,business_date)')
+            con.execute('CREATE INDEX IF NOT EXISTS ix_shipment_amount_latest ON shipment_amount_current(record_key,modified_us DESC,generated_us DESC,indexed_us DESC,source_id)')
             for d in config['splunk_sources']:
                 h=source_fingerprint(d)
                 old=con.execute('SELECT * FROM source_state WHERE source_id=?',(d['id'],)).fetchone()

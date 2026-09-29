@@ -96,15 +96,21 @@ def scope_rules(p):
 def canonical(filters,direction):
     return json.dumps(sorted(normalize_rules(filters,direction),key=lambda r:(r['field_key'],r['operator'],r['filter_value'])),sort_keys=True,ensure_ascii=False)
 
-def cte(direction,metric):
+def cte(direction,metric,limit_start=False,limit_end=False):
     if direction not in ('inbound','shipment','inventory'): raise ValueError('invalid direction')
     if metric not in METRICS: raise ValueError('invalid metric')
     table='shipment_box_current' if direction=='shipment' and metric=='BOX' else direction+'_current'
     shipment=direction=='shipment' and metric!='BOX'
-    # Amount source has the same billing-item business key. Prefer the continuous collector.
-    amount_cte="""WITH am AS (
+    # Restrict the expensive latest-amount window to the reporting period whenever possible.
+    amount_where=''
+    if shipment:
+        clauses=[]
+        if limit_start: clauses.append('business_date>=:cte_start')
+        if limit_end: clauses.append('business_date<=:cte_end')
+        if clauses: amount_where=' WHERE '+' AND '.join(clauses)
+    amount_cte=(f"""WITH am AS (
       SELECT *,ROW_NUMBER() OVER(PARTITION BY record_key ORDER BY modified_us DESC,generated_us DESC,indexed_us DESC,source_id) rn
-      FROM shipment_amount_current), """ if shipment else 'WITH '
+      FROM shipment_amount_current{amount_where}), """ if shipment else 'WITH ')
     joins=''
     customer="COALESCE(NULLIF(f.customer_key,''),'')"
     customer_name="COALESCE(NULLIF(c.customer_name,''),NULLIF(f.customer_key,''),'미분류')"
@@ -164,19 +170,21 @@ def supported(direction,metric,filters=()):
             return False,'출하 BOX의 ITEM/거래선별 배분 매핑 미제공'
     return True,''
 
+def source_available(con,direction,metric):
+    domain='shipment_box' if direction=='shipment' and metric=='BOX' else direction
+    state=con.execute('SELECT MAX(last_success) ok FROM source_state WHERE domain=? AND enabled=1',(domain,)).fetchone()
+    if state and state['ok']: return True
+    return con.execute(f'SELECT 1 FROM {domain}_current LIMIT 1').fetchone() is not None
+
 def aggregate(con,direction,metric,start,end,filters=(),group=None):
     ok,note=supported(direction,metric,filters)
     if not ok: return {'value':None,'observed':None,'count':0,'missing':0,'status':'not_available','note':note} if not group else []
-    domain='shipment_box' if direction=='shipment' and metric=='BOX' else direction
     # Absence of a successful source is not an observed zero.
-    state=con.execute('SELECT MAX(last_success) ok FROM source_state WHERE domain=? AND enabled=1',(domain,)).fetchone()
-    if not state or not state['ok']:
-        any_fact=con.execute(f'SELECT 1 FROM {domain}_current LIMIT 1').fetchone()
-        if not any_fact:
-            return [] if group else {'value':None,'observed':None,'count':0,'missing':0,'status':'not_available','note':'원천 미수집'}
+    if not source_available(con,direction,metric):
+        return [] if group else {'value':None,'observed':None,'count':0,'missing':0,'status':'not_available','note':'원천 미수집'}
     where,bind=filter_sql(list(filters),direction)
     clause=base_filter(direction)+' AND '+where+' AND s.business_date BETWEEN :start AND :end'
-    bind.update(start=start,end=end)
+    bind.update(start=start,end=end,cte_start=start,cte_end=end)
     group_expr={'date':'s.business_date','hour':"CASE WHEN s.business_time GLOB '[0-2][0-9][0-5][0-9][0-5][0-9]' AND substr(s.business_time,1,2)<'24' THEN substr(s.business_time,1,2) ELSE 'UNKNOWN' END",
                 'item':'s.item_key','customer':'s.customer_key'}.get(group)
     if group and group_expr is None: raise ValueError('invalid grouping')
@@ -185,7 +193,7 @@ def aggregate(con,direction,metric,start,end,filters=(),group=None):
     else:
         ve=value_expr(direction,metric);val=f'SUM({ve})';missing=f'SUM(CASE WHEN {ve} IS NULL THEN 1 ELSE 0 END)';scale=SCALE
     extra=(f'{group_expr} group_key,MIN(s.product_name) product_name,MIN(s.product_group) product_group,MIN(s.customer_name) customer_name,' if group else '')
-    sql=cte(direction,metric)+f'SELECT {extra} COUNT(*) count,{val} val,{missing} missing FROM r s WHERE {clause}'
+    sql=cte(direction,metric,True,True)+f'SELECT {extra} COUNT(*) count,{val} val,{missing} missing FROM r s WHERE {clause}'
     if group: sql+=' GROUP BY '+group_expr+' ORDER BY '+group_expr
     rows=con.execute(sql,bind).fetchall();result=[]
     for row in rows:
@@ -195,14 +203,56 @@ def aggregate(con,direction,metric,start,end,filters=(),group=None):
     return result if group else result[0]
 
 def latest(con,direction,metric='EA'):
-    r=con.execute(cte(direction,metric)+f'SELECT MAX(s.business_date) d FROM r s WHERE {base_filter(direction)} AND s.business_date<=?',(today(),)).fetchone()
-    return r['d']
+    table='shipment_box_current' if direction=='shipment' and metric=='BOX' else direction+'_current'
+    parts=["deleted=0","scope_ok=1","plant='P1M1'",
+           "warehouse NOT IN ('63D0','63J0','63P0','13H0')","business_date<=:today"]
+    if direction=='inbound':
+        parts+=["COALESCE(json_extract(payload_json,'$.C_ID'),'') IN ('CO','GO')",
+                "COALESCE(json_extract(payload_json,'$.I_TYPE'),'')!='34'",
+                "COALESCE(json_extract(payload_json,'$.I_DATE'),'VALID') NOT IN ('','00000000')"]
+    elif direction=='shipment':
+        parts+=["document_no LIKE '6%'"]
+    row=con.execute(f"SELECT MAX(business_date) d FROM {table} WHERE "+' AND '.join(parts),{'today':today()}).fetchone()
+    return row['d']
 
-def asof(con,p):
+def latest_dates(con):
+    return {'inbound':latest(con,'inbound'),'shipment':latest(con,'shipment'),
+            'shipment_box':latest(con,'shipment','BOX')}
+
+def asof(con,p,dates=None):
     requested=param(p,'date')
     if requested:return min(valid_day(requested),today())
-    dates=[latest(con,'inbound'),latest(con,'shipment'),latest(con,'shipment','BOX')]
-    return max((x for x in dates if x),default=today())
+    dates=dates or latest_dates(con)
+    return max((x for x in dates.values() if x),default=today())
+
+def aggregate_windows(con,direction,metric,mstart,as_of,prev,filters=()):
+    ok,note=supported(direction,metric,filters)
+    def unavailable(status,note):
+        item={'value':None,'observed':None,'count':0,'missing':0,'status':status,'note':note}
+        return {'mtd':dict(item),'today':dict(item),'yesterday':dict(item)}
+    if not ok:return unavailable('not_available',note)
+    if not source_available(con,direction,metric):return unavailable('not_available','원천 미수집')
+    where,bind=filter_sql(list(filters),direction)
+    scan_start=min(mstart,prev)
+    conds={'mtd':"s.business_date BETWEEN :mstart AND :asof",'today':"s.business_date=:asof",'yesterday':"s.business_date=:prev"}
+    cols=[];inbound_box=metric=='BOX' and direction!='shipment';ve=None if inbound_box else value_expr(direction,metric)
+    for name,cond in conds.items():
+        cols.append(f"COALESCE(SUM(CASE WHEN {cond} THEN 1 ELSE 0 END),0) {name}_count")
+        if inbound_box:
+            cols.append(f"COUNT(DISTINCT CASE WHEN {cond} THEN NULLIF(s.box_no,'') END) {name}_val")
+            cols.append(f"COALESCE(SUM(CASE WHEN {cond} AND s.box_no='' THEN 1 ELSE 0 END),0) {name}_missing")
+        else:
+            cols.append(f"COALESCE(SUM(CASE WHEN {cond} THEN {ve} END),0) {name}_val")
+            cols.append(f"COALESCE(SUM(CASE WHEN {cond} AND {ve} IS NULL THEN 1 ELSE 0 END),0) {name}_missing")
+    bind.update(mstart=mstart,asof=as_of,prev=prev,scan_start=scan_start,cte_start=scan_start,cte_end=as_of)
+    sql=cte(direction,metric,True,True)+f"""SELECT {','.join(cols)} FROM r s
+      WHERE {base_filter(direction)} AND {where} AND s.business_date BETWEEN :scan_start AND :asof"""
+    row=con.execute(sql,bind).fetchone();scale=1 if inbound_box else SCALE;out={}
+    for name in conds:
+        count=row[name+'_count'] or 0;missing=row[name+'_missing'] or 0;observed=float(row[name+'_val'] or 0)/scale
+        out[name]={'value':None if missing else observed,'observed':observed,'count':count,'missing':missing,
+                   'status':'partial' if missing else 'ok','note':''}
+    return out
 
 def system_target(con,direction,metric,ym,filters):
     if metric=='BOX': return None,'목표 없음'
@@ -256,9 +306,11 @@ def resolve_target(con,ym,direction,metric,filters=()):
 def kpi(p):
     p=clean_params(p);metric=p.get('metric','EA');filters=scope_rules(p)
     with contextlib.closing(runtime.connect()) as con:
-        con.execute('BEGIN');d=asof(con,p);prev=(datetime.strptime(d,'%Y%m%d')-timedelta(days=1)).strftime('%Y%m%d');out={}
+        con.execute('BEGIN');dates=latest_dates(con);d=asof(con,p,dates)
+        prev=(datetime.strptime(d,'%Y%m%d')-timedelta(days=1)).strftime('%Y%m%d');out={}
         for direction,name in [('inbound','production'),('shipment','shipment')]:
-            m=aggregate(con,direction,metric,d[:6]+'01',d,filters);t=aggregate(con,direction,metric,d,d,filters);y=aggregate(con,direction,metric,prev,prev,filters)
+            windows=aggregate_windows(con,direction,metric,d[:6]+'01',d,prev,filters)
+            m,t,y=windows['mtd'],windows['today'],windows['yesterday']
             target=resolve_target(con,d[:6],direction,metric,filters);tv=target['target_value'];actual=m['value']
             if direction=='inbound' and metric=='USD':target.update(target_available=False,target_value=None,source='NONE');tv=None
             out[name]={'target':tv,'target_available':target['target_available'],'target_source':target['source'],'target_id':target['target_id'],
@@ -271,7 +323,7 @@ def kpi(p):
         inv=aggregate(con,'inventory',metric,'00010101','99991231',filters) if invcnt else {'value':None,'count':0,'status':'not_available'}
         out.update(inventory={'current':inv['value'],'available':None,'count':inv['count'],'status':inv['status'],
                               'note':'현재 스냅샷. 가용재고/과거재고 산출 규칙 미제공'},
-                   metric=metric,date=d,inbound_as_of=d,shipment_as_of=d,latest_inbound_date=latest(con,'inbound'),latest_shipment_date=latest(con,'shipment'),
+                   metric=metric,date=d,inbound_as_of=d,shipment_as_of=d,latest_inbound_date=dates['inbound'],latest_shipment_date=dates['shipment'],
                    timestamp=datetime.now(KST).isoformat(),demo=runtime.DEMO)
         return out
 
@@ -280,11 +332,11 @@ def hourly(p):
     with contextlib.closing(runtime.connect()) as con:
         con.execute('BEGIN');d=asof(con,p);out={};unknown={}
         for direction,name in [('inbound','production'),('shipment','shipment')]:
-            rows=aggregate(con,direction,metric,d,d,filters,'hour');data={r['group_key']:r['value'] for r in rows}
-            ok,_=supported(direction,metric,filters)
-            ok=ok and aggregate(con,direction,metric,d,d,filters)['status']!='not_available'
-            out[name]=[data.get(f'{h:02d}',0) if ok else None for h in range(24)]
-            unknown[name]=data.get('UNKNOWN',0)
+            ok,_=supported(direction,metric,filters);available=ok and source_available(con,direction,metric)
+            rows=aggregate(con,direction,metric,d,d,filters,'hour') if available else []
+            data={r['group_key']:r['value'] for r in rows}
+            out[name]=[data.get(f'{h:02d}',0) if available else None for h in range(24)]
+            unknown[name]=data.get('UNKNOWN',0) if available else None
         return {**out,'hours':[f'{h:02d}' for h in range(24)],'unknown_time':unknown,'current_hour':datetime.now(KST).hour,
                 'inbound_date':d,'shipment_date':d,'metric':metric}
 

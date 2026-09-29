@@ -23,6 +23,7 @@
   const charts={};const previousValues=new WeakMap();const animationFrames=new WeakMap();
   const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
   let pollTimer=null, cycleTimer=null, generation=0, controller=null, toastTimer=null, filterOptionsSignature='';
+  let focusLoadedAt=0,focusMetric='';
   let identity=()=>JSON.stringify([state.filters,state.metric]);
   const suffix=div=>({1:'',1000:'K',1000000:'M',100000000:'억',1000000000:'B'}[div]||'');
   function unitLabel(metric=state.metric, full=false){
@@ -351,9 +352,8 @@
     renderCharts();markErrors();requestAnimationFrame(fitNumbers);
     if(updateHash)window.scrollTo({top:0,behavior:'instant'});
     if(view==='targets'&&window.SCMTargets&&typeof window.SCMTargets.load==='function')window.SCMTargets.load();
-    if(window.SCMFocus&&typeof window.SCMFocus.load==='function'){window.SCMFocus.syncMetric();window.SCMFocus.load(state.metric);}
   }
-  function stepView(delta){goView(VIEWS[(VIEWS.indexOf(state.view)+delta+4)%4]);}
+  function stepView(delta){goView(VIEWS[(VIEWS.indexOf(state.view)+delta+VIEWS.length)%VIEWS.length]);}
   function paramsFor(endpoint,snapshot,metricOverride){
     const params=C.requestParams(endpoint,snapshot,cfg.endpointParameters);
     if(metricOverride)params.metric=metricOverride;
@@ -385,38 +385,62 @@
   function schedule(){
     clearTimeout(pollTimer);if(state.refresh>0&&!document.hidden)pollTimer=setTimeout(()=>refresh(),state.refresh*1000);
   }
+  function applyResults(results){
+    const oldEvents=state.data.events?.events||[],oldProgress=state.data['inbound-progress']?.progress||[];
+    results.forEach(r=>{state.statuses[r.name]=r;state.data[r.name]=r.data;});
+    const events=state.data.events?.events||[];
+    state.newEvents=C.newEventKeys(oldEvents,events,state.eventInitialized);if(state.data.events)state.eventInitialized=true;
+    const pkeys=new Set(oldProgress.map(progressKey));
+    state.newProgress=new Set(state.progressInitialized?(state.data['inbound-progress']?.progress||[]).map(progressKey).filter(k=>!pkeys.has(k)):[]);
+    if(state.data['inbound-progress'])state.progressInitialized=true;
+  }
+  function viewTaskSpecs(snapshot){
+    const tasks=[],add=(name,endpoint=name,ttl=0,metricOverride=null)=>tasks.push([name,endpoint,ttl,metricOverride]);
+    add('filters','filters',600000);
+    if(state.view==='overview'){
+      add('hourly','hourly',0);add('customers','customers',5000);add('events','events',2000);add('alerts','alerts',10000);
+      if(state.overviewPeriod==='daily')add('daily-trend','daily-trend',(cfg.dailyRefreshSeconds||30)*1000);
+    }else if(state.view==='inbound'){
+      add('hourly','hourly',0);add('daily-trend','daily-trend',(cfg.dailyRefreshSeconds||30)*1000);
+      add('items','items',5000);add('events','events',2000);add('inbound-progress','inbound-progress',2000);
+    }else if(state.view==='shipment'){
+      add('hourly','hourly',0);add('daily-trend','daily-trend',(cfg.dailyRefreshSeconds||30)*1000);
+      add('customers','customers',5000);add('items','items',5000);add('events','events',2000);
+      if(snapshot.metric!=='USD')add('usdKpi','kpi',3000,'USD');
+    }
+    return tasks;
+  }
+  function deferFocus(){
+    if(!['overview','inbound','shipment'].includes(state.view)||!window.SCMFocus)return;
+    if(focusMetric===state.metric&&Date.now()-focusLoadedAt<30000)return;
+    const expectedView=state.view,run=()=>{
+      if(expectedView!==state.view||!window.SCMFocus)return;
+      focusMetric=state.metric;focusLoadedAt=Date.now();window.SCMFocus.syncMetric();window.SCMFocus.load(state.metric);
+    };
+    if('requestIdleCallback' in window)requestIdleCallback(run,{timeout:1200});else setTimeout(run,250);
+  }
   async function refresh(force=false){
     if(state.busy&&!force)return;
     clearTimeout(pollTimer);controller?.abort();controller=new AbortController();const signal=controller.signal,token=++generation;
     state.busy=true;renderStatus();
     const snapshot=JSON.parse(JSON.stringify({metric:state.metric,filters:state.filters,range:state.range,month:state.month}));
-    const tasks=[['kpi','kpi',0],['hourly','hourly',0],['customers','customers',0],['items','items',0],['events','events',0],['inbound-progress','inbound-progress',0],['alerts','alerts',0],['filters','filters',600000],['daily-trend','daily-trend',(cfg.dailyRefreshSeconds||60)*1000]];
-    // At most one cycle runs. Within a cycle the existing independent REST calls run concurrently.
-    const promises=tasks.map(([name,endpoint,ttl])=>fetchOne(name,endpoint,paramsFor(endpoint,snapshot),signal,force,ttl));
-    if(snapshot.metric!=='USD')promises.push(fetchOne('usdKpi','kpi',paramsFor('kpi',snapshot,'USD'),signal,force,0));
-    const results=await Promise.all(promises);
+    const main=await fetchOne('kpi','kpi',paramsFor('kpi',snapshot),signal,force,0);
     if(token!==generation||signal.aborted)return;
-    if(snapshot.metric==='USD'){const main=results.find(r=>r.name==='kpi');results.push({...main,name:'usdKpi'});}
-    const main=results.find(r=>r.name==='kpi');
-    // With 'latest' selected, the monthly API must follow the actual response month, not the browser month.
+    applyResults([main]);
+    if(snapshot.metric==='USD'){state.statuses.usdKpi={...main,name:'usdKpi'};state.data.usdKpi=main.data;}
     const actualMonth=!snapshot.filters.date&&C.validDate(main?.data?.date)?main.data.date.replace(/-/g,'').slice(0,6):snapshot.month;
-    if(actualMonth!==snapshot.month){
-      const r=await fetchOne('daily-trend','daily-trend',paramsFor('daily-trend',{...snapshot,month:actualMonth}),signal,true,0);
-      if(token!==generation||signal.aborted)return;
-      const i=results.findIndex(x=>x.name==='daily-trend');results[i]=r;state.month=actualMonth;
-    }
-    const oldEvents=state.data.events?.events||[];
-    const oldProgress=state.data['inbound-progress']?.progress||[];
-    results.forEach(r=>{state.statuses[r.name]=r;state.data[r.name]=r.data;});
-    const events=state.data.events?.events||[];
-    state.newEvents=C.newEventKeys(oldEvents,events,state.eventInitialized);if(state.data.events)state.eventInitialized=true;
-    const pkeys=new Set(oldProgress.map(progressKey));state.newProgress=new Set(state.progressInitialized?(state.data['inbound-progress']?.progress||[]).map(progressKey).filter(k=>!pkeys.has(k)):[]);if(state.data['inbound-progress'])state.progressInitialized=true;
-    state.busy=false;
+    if(actualMonth!==snapshot.month){snapshot.month=actualMonth;state.month=actualMonth;}
+    renderKPI(false);renderStatus();
+    const specs=viewTaskSpecs(snapshot);
+    const results=await Promise.all(specs.map(([name,endpoint,ttl,metricOverride])=>
+      fetchOne(name,endpoint,paramsFor(endpoint,snapshot,metricOverride),signal,force&&name!=='filters',ttl)));
+    if(token!==generation||signal.aborted)return;
+    applyResults(results);state.busy=false;
     const currentIdentity=identity(),animate=currentIdentity===state.lastIdentity&&!main?.error;
     renderAll(animate);state.lastIdentity=currentIdentity;
     if(demo)state.tick++;
-    window.SCMFocus?.load(state.metric);
     if(state.view==='targets')window.SCMTargets?.load();
+    deferFocus();
     if($('#infoDialog').open)renderInfo();
     schedule();
   }
@@ -474,7 +498,7 @@
       else if(b.dataset.customer){goView('shipment');selectFilter('customer',b.dataset.customer);}
       else if(b.dataset.key&&b.dataset.action)selectFilter(b.dataset.action,b.dataset.key);
       else if(b.dataset.removeFilter){state.filters[b.dataset.removeFilter]='ALL';renderFilters();invalidate();}
-      else if(b.dataset.period){state.overviewPeriod=b.dataset.period;$$('[data-period]').forEach(x=>{const a=x===b;x.classList.toggle('active',a);x.setAttribute('aria-pressed',String(a));});renderCharts();markErrors();}
+      else if(b.dataset.period){state.overviewPeriod=b.dataset.period;$('[data-period]').forEach(x=>{const a=x===b;x.classList.toggle('active',a);x.setAttribute('aria-pressed',String(a));});renderCharts();markErrors();if(state.overviewPeriod==='daily'&&!state.data['daily-trend'])refresh(true);}
       else if(b.dataset.shipmentTab){state.shipmentTab=b.dataset.shipmentTab;state.sort.shipmentTable=null;state.search.shipmentTable='';$('[data-search="shipmentTable"]').value='';$$('[data-shipment-tab]').forEach(x=>{const a=x===b;x.classList.toggle('active',a);x.setAttribute('aria-pressed',String(a));});renderTable('shipmentTable');markErrors();}
       else if(b.dataset.inboundTab){state.inboundTab=b.dataset.inboundTab;$$('[data-inbound-tab]').forEach(x=>{const a=x===b;x.classList.toggle('active',a);x.setAttribute('aria-pressed',String(a));});renderProgress();markErrors();}
       else if(b.dataset.range){state.range=b.dataset.range;$$('[data-range]').forEach(x=>{const a=x===b;x.classList.toggle('active',a);x.setAttribute('aria-pressed',String(a));});invalidate();}
@@ -511,7 +535,7 @@
       if(['1','2','3','4','5'].includes(e.key)){goView(VIEWS[Number(e.key)-1]);}
       else if(e.key==='ArrowRight'){e.preventDefault();stepView(1);}else if(e.key==='ArrowLeft'){e.preventDefault();stepView(-1);}
     });
-    window.addEventListener('hashchange',()=>goView(location.hash.slice(1),false));
+    window.addEventListener('hashchange',()=>{const next=location.hash.slice(1),changed=VIEWS.includes(next)&&next!==state.view;goView(next,false);if(changed&&state.statuses.kpi?.data)refresh(true);});
     window.addEventListener('resize',()=>requestAnimationFrame(fitNumbers));
     document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(pollTimer);controller?.abort();++generation;state.busy=false;}else if(state.refresh>0)refresh(true);});
     document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)document.body.classList.remove('presentation');requestAnimationFrame(fitNumbers);});

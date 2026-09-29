@@ -60,6 +60,9 @@ class Helpers(unittest.TestCase):
 
 class Facts(Base):
     def test_integrity(self): self.assertEqual(self.db.query('PRAGMA quick_check')[0]['quick_check'],'ok')
+    def test_initialize_without_migration_skips_backup(self):
+        with patch.object(self.db,'backup',side_effect=AssertionError('unchanged schema must not trigger a full DB backup')):
+            self.db.initialize(self.cfg)
     def test_latest_row_full(self):
         first=event(self.d,key='1',qty='100',at=self.at,PALLET='old')
         last=event(self.d,key='1',qty='200',at=self.at,changed=self.at+timedelta(minutes=5),PALLET='')

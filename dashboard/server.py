@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Portable standard-library HTTP API. Same route names; local-only by default."""
 from __future__ import annotations
-import sys, json, logging, mimetypes, threading
+import sys, json, logging, mimetypes, threading, time
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlsplit, parse_qs, unquote
@@ -34,6 +34,29 @@ POST={
 for action in ('create','batch_create','delete','delete_batch','update'):
     POST['/api/focus/'+action]=lambda b,a=action:fm.handle_post({**b,'action':a})
 
+_READ_CACHE_TTL={'/api/kpi':2.0,'/api/hourly':3.0,'/api/daily-trend':20.0,'/api/customers':10.0,
+                 '/api/items':10.0,'/api/events':2.0,'/api/inbound-progress':2.0,'/api/alerts':10.0,
+                 '/api/filters':300.0,'/api/health':3.0}
+_read_cache={};_read_cache_lock=threading.Lock()
+def _read_cache_key(path,p):return path+'?'+json.dumps(sorted(p.items()),ensure_ascii=False,separators=(',',':'))
+def _read_cache_get(path,p):
+    ttl=_READ_CACHE_TTL.get(path,0)
+    if ttl<=0:return None
+    key=_read_cache_key(path,p);now=time.monotonic()
+    with _read_cache_lock:
+        hit=_read_cache.get(key)
+        if hit and now-hit[0]<ttl:return hit[1]
+        if hit:_read_cache.pop(key,None)
+    return None
+def _read_cache_set(path,p,value):
+    if path not in _READ_CACHE_TTL:return
+    key=_read_cache_key(path,p)
+    with _read_cache_lock:
+        if len(_read_cache)>256:_read_cache.clear()
+        _read_cache[key]=(time.monotonic(),value)
+def clear_read_cache():
+    with _read_cache_lock:_read_cache.clear()
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'
     def setup(self):
@@ -64,7 +87,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed=urlsplit(self.path);path=unquote(parsed.path)
         try:
             p=reporting.clean_params(parse_qs(parsed.query))
-            if path in ROUTES:self.send_json(ROUTES[path](p));return
+            if path in ROUTES:
+                cached=_read_cache_get(path,p)
+                if cached is not None:self.send_json(cached);return
+                data=ROUTES[path](p);_read_cache_set(path,p,data);self.send_json(data);return
             if path=='/runtime-config.js':
                 body='window.SCM_RUNTIME='+json.dumps({'demoBackend':runtime.DEMO,'inventoryConnected':reporting.health()['inventory_connected']})+';'
                 self.send_bytes(body.encode(),mime='application/javascript; charset=utf-8');return
@@ -96,7 +122,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body,dict):raise ValueError('JSON object required')
             path=urlsplit(self.path).path
             if path not in POST:self.send_json({'error':'Not found'},404);return
-            self.send_json(POST[path](body))
+            result=POST[path](body);clear_read_cache();self.send_json(result)
         except (ValueError,TypeError,KeyError) as e:self.send_json({'error':str(e)[:250]},400)
         except Exception:
             logging.exception('Local write failed');self.send_json({'error':'Local write failed; transaction rolled back'},500)

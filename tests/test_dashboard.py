@@ -21,6 +21,15 @@ class DashboardTests(unittest.TestCase):
     def test_initialize_twice_preserves_facts(self):
         before=r.kpi({})['shipment']['actual_mtd'];self.db.initialize(self.s.config);runtime.ensure_runtime()
         self.assertEqual(before,r.kpi({})['shipment']['actual_mtd'])
+    def test_latest_date_lookup_skips_heavy_reporting_cte(self):
+        with contextlib.closing(self.con()) as con,patch.object(r,'cte',side_effect=AssertionError('latest date must not build reporting CTE')):
+            self.assertEqual(r.latest(con,'inbound'),self.day)
+            self.assertEqual(r.latest(con,'shipment'),self.day)
+            self.assertEqual(r.latest(con,'shipment','BOX'),self.day)
+    def test_reporting_indexes_exist(self):
+        with contextlib.closing(self.con()) as con:
+            names={x[0] for x in con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn('ix_shipment_report',names);self.assertIn('ix_shipment_amount_latest',names)
     def test_kpi_hourly_ea(self):
         k=r.kpi({});h=r.hourly({})
         for key in ('production','shipment'):self.assertAlmostEqual(k[key]['actual_today'],sum(h[key]),places=4)
