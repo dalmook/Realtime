@@ -20,7 +20,8 @@ jobs:
           text = b''.join(p.read_bytes().strip() for p in paths)
           print('PARTS', [(p.name, p.stat().st_size) for p in paths])
           print('BASE64_LENGTH', len(text))
-          raw = base64.b64decode(text + b'=' * (-len(text) % 4), validate=False)
+          text = text[:len(text)//4*4]
+          raw = base64.b64decode(text, validate=True)
           print('COMPRESSED_LENGTH', len(raw), 'HEADER', raw[:16].hex())
           out = bytearray()
           decoder = lzma.LZMADecompressor()
