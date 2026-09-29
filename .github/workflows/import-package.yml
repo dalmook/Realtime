@@ -1,0 +1,76 @@
+name: Import verified source package
+on:
+  push:
+    branches: [main]
+    paths: ['.import/READY.json']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: source-import
+  cancel-in-progress: false
+jobs:
+  import:
+    if: github.repository == 'dalmook/Realtime'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Verify and restore reviewed package
+        run: |
+          python - <<'PY'
+          import base64, hashlib, io, json, pathlib, tarfile
+          root = pathlib.Path.cwd()
+          marker = root / '.import/READY.json'
+          if not marker.exists():
+              raise SystemExit('No completed upload marker')
+          manifest = json.loads(marker.read_text())
+          parts = []
+          for part in manifest['parts']:
+              path = root / '.import' / part['name']
+              data = path.read_bytes()
+              if hashlib.sha256(data).hexdigest() != part['sha256']:
+                  raise SystemExit('Upload part checksum mismatch: ' + part['name'])
+              parts.append(data)
+          packed = base64.b64decode(b''.join(parts), validate=True)
+          if hashlib.sha256(packed).hexdigest() != manifest['archive_sha256']:
+              raise SystemExit('Archive checksum mismatch')
+          with tarfile.open(fileobj=io.BytesIO(packed), mode='r:xz') as archive:
+              for entry in archive.getmembers():
+                  path = pathlib.PurePosixPath(entry.name)
+                  if path.is_absolute() or '..' in path.parts or not entry.isfile():
+                      raise SystemExit('Unsafe archive entry: ' + entry.name)
+                  if entry.size > 5000000:
+                      raise SystemExit('Oversized archive entry')
+                  if entry.name not in manifest['files']:
+                      raise SystemExit('Unexpected archive entry: ' + entry.name)
+                  data = archive.extractfile(entry).read()
+                  if hashlib.sha256(data).hexdigest() != manifest['files'][entry.name]:
+                      raise SystemExit('File checksum mismatch: ' + entry.name)
+                  dest = root / path
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(data)
+          print('Restored', len(manifest['files']), 'verified source files')
+          PY
+      - name: Test without company services
+        run: python -S -m unittest discover -s tests -v
+      - name: Rebuild synthetic static demo and portable ZIP
+        run: |
+          python tools/build_site.py
+          python tools/build_package.py --output release/SCMRealtimeDB_portable.zip
+      - name: Commit restored project
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all -- . ':!.import' ':!release'
+          git commit -m 'Restore portable SCM dashboard, synthetic demo and documentation' || test -z "$(git status --porcelain --untracked-files=no)"
+          git push origin HEAD:main
+      - name: Publish verified portable package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag=v1.2.1-realtime
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target main --title 'SCM Realtime 1.2.1 — portable package' --notes 'Restored source with isolated synthetic demo. No company credentials, runtime databases or logs are included. Windows and live company connectivity require environment-specific verification.'
+          gh release upload "$tag" release/SCMRealtimeDB_portable.zip --clobber
