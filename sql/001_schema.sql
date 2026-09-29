@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS dim_conversion(
  period_ym TEXT NOT NULL, material TEXT NOT NULL, unit TEXT NOT NULL,
  eq_per_unit TEXT NOT NULL, reference_source TEXT NOT NULL, snapshot_id TEXT NOT NULL,
  PRIMARY KEY(period_ym,material,unit));
+CREATE TABLE IF NOT EXISTS dim_conversion_component(
+ period_ym TEXT NOT NULL, material TEXT NOT NULL, conv_code TEXT NOT NULL,
+ conv_family TEXT NOT NULL CHECK(conv_family IN ('DRAM','FLASH','OTHER')),
+ eq_per_unit TEXT NOT NULL, reference_source TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+ PRIMARY KEY(period_ym,material,conv_code));
+CREATE INDEX IF NOT EXISTS ix_conversion_component_material
+ ON dim_conversion_component(material,period_ym,conv_family);
 CREATE TABLE IF NOT EXISTS plan_monthly(
  plan_id TEXT PRIMARY KEY, reference_source TEXT NOT NULL, snapshot_id TEXT NOT NULL,
  direction TEXT NOT NULL CHECK(direction IN ('inbound','shipment')),
