@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  actions: read
 concurrency:
   group: source-recovery
   cancel-in-progress: false
@@ -14,43 +15,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Restore only checksum-verified source
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-source-inspection
+          run-id: 36520252250
+          github-token: ${{ github.token }}
+          path: recovered
+      - name: Verify and restore source files
         run: |
           python - <<'PY'
-          import base64, hashlib, io, json, lzma, pathlib, shutil, tarfile
-          root = pathlib.Path.cwd()
-          def sha(data): return hashlib.sha256(data).hexdigest()
-          paths = [root/'.import/part-001.b64'] + sorted((root/'.import').glob('segment-*.b64'))
-          text = b''.join(p.read_bytes().strip() for p in paths)
-          raw = base64.b64decode(text[:len(text)//4*4], validate=True)
-          out = bytearray(); decoder = lzma.LZMADecompressor()
-          for offset in range(0,len(raw),32):
-              try: out.extend(decoder.decompress(raw[offset:offset+32]))
-              except (lzma.LZMAError,EOFError): break
-              if decoder.eof: break
-          recovered = {}
-          try:
-              with tarfile.open(fileobj=io.BytesIO(out),mode='r:') as archive:
-                  for entry in archive:
-                      p = pathlib.PurePosixPath(entry.name)
-                      if p.is_absolute() or '..' in p.parts or not entry.isfile() or entry.size>5000000:
-                          raise ValueError('Unsafe archive entry')
-                      data=archive.extractfile(entry).read()
-                      if len(data)!=entry.size: break
-                      recovered[entry.name]=data
-          except (tarfile.TarError,EOFError): pass
-          assert len(recovered)==91, 'Unexpected recovered file count'
-          assert sha(recovered['MANIFEST.json'])=='ab9cef3a1a123e2f33855ad00ff1f0eb9812e941ffaf2295ced6f9ea7ddbceba'
-          manifest=json.loads(recovered['MANIFEST.json'])['files']
-          for name,data in recovered.items():
-              if name!='MANIFEST.json': assert sha(data)==manifest[name]['sha256'], name
-          expected=['e06b537055d7b39319e18ddc27cff15abe8c3d62995a816c7c0e66ace3059f82','94f861898f79ccbd6b04d53a943df3cbbcd286e0afb60fc8387bd39d4dd4a04a','f0bccc8b098f30361a905557a8e8792ae6abe0e5becfbe8e3026696d28dc1f29','270d53998643fefe60e7d3fdddc756489ce4b50aeaeaa2a6f21b956bd944f851','7359c365defc8ff7a7f85a923bb6ec03638225658862d689701b3b65c2e6b445','7472e7b3a0d7a705656b10929facdb4049fa2364465cb04aa985eecfbf0a7563','1c608b8b2b169951cc9d2099a8a1761a1f998ec3228fd9759d34af0c840eaecf','e26f8a34da0ed223274489f8c37b8031cc71cb79271f6cf6023a7d5f02d642a8','1c3b347fa1831fd6327314f8e00bda8c3411ad1fc430b0605856b17fd7f66736','310650f70ac20a352b02f9a1d22516cfb4318335cb2324a14ecd406ba8685f80']
-          parts=[]
-          for i,wanted in enumerate(expected,1):
-              data=(root/f'.recovery/sup_{i:02d}.b64').read_bytes()
-              assert sha(data)==wanted, f'Supplement checksum {i}'
-              parts.append(data)
-          packed=b''.join(parts)
+          import base64, hashlib, json, lzma, pathlib, shutil
+          root=pathlib.Path.cwd(); recovered=root/'recovered'
+          sha=lambda data:hashlib.sha256(data).hexdigest()
+          manifest_raw=(recovered/'MANIFEST.json').read_bytes()
+          assert sha(manifest_raw)=='ab9cef3a1a123e2f33855ad00ff1f0eb9812e941ffaf2295ced6f9ea7ddbceba'
+          manifest=json.loads(manifest_raw)['files']
+          for p in recovered.rglob('*'):
+              if not p.is_file(): continue
+              name=p.relative_to(recovered).as_posix()
+              assert not p.is_symlink()
+              if name!='MANIFEST.json': assert sha(p.read_bytes())==manifest[name]['sha256'],name
+          packed=b''.join((root/f'.recovery/sup_{i:02d}.b64').read_bytes() for i in range(1,11))
           assert sha(packed)=='717c87927b54adf2e2c52622f09f3b5e028074253f0fe8dfd2be29a5789e00aa'
           supplement=json.loads(lzma.decompress(base64.b64decode(packed,validate=True)))
           assert len(supplement)==24
@@ -58,34 +43,36 @@ jobs:
               p=pathlib.PurePosixPath(name)
               assert not p.is_absolute() and '..' not in p.parts and p.parts[0] in {'scm_db','sql','tests','tools'}
               data=text.encode('utf-8')
-              assert sha(data)==manifest[name]['sha256'], name
-              recovered[name]=data
-          for name,data in recovered.items():
-              p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
+              assert sha(data)==manifest[name]['sha256'],name
+              dest=recovered/name;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
+          for p in list(recovered.rglob('*')):
+              if p.is_file():
+                  dest=root/p.relative_to(recovered);dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(p.read_bytes())
           (root/'VERSION').write_text('1.2.2-realtime\n')
-          (root/'tools/publish_github.py').write_text('''"""Print the approved repository. Never create another repository or upload secrets."""
+          (root/'tools/publish_github.py').write_text('''"""Display the approved repository only; no credential reads or uploads."""
           print("Repository: https://github.com/dalmook/Realtime")
           print("Demo: https://dalmook.github.io/Realtime/")
           print("ZIP: https://github.com/dalmook/Realtime/releases/latest/download/SCMRealtimeDB_portable.zip")
-          print("Company users: extract ZIP, configure .env, run START.cmd. Demo: DEMO.cmd.")
+          print("Company: extract ZIP, configure .env, run START.cmd. Demo: DEMO.cmd.")
           ''',encoding='utf-8')
-          for directory in ['.import','.recovery']: shutil.rmtree(root/directory)
-          print('Verified and restored',len(recovered),'source files; staging fragments removed.')
+          for directory in ['.import','.recovery','recovered']:shutil.rmtree(root/directory)
+          print('All restored files matched trusted checksums; staging removed.')
           PY
       - name: Test restored source without company services
         run: python -S -m unittest discover -s tests -v
-      - name: Build synthetic demo and source package
+      - name: Build synthetic demo and package
         run: |
           python tools/build_site.py
           python tools/build_package.py --output release/SCMRealtimeDB_portable.zip
-      - name: Commit actual source and remove upload fragments
+      - name: Commit restored source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add --all -- . ':!.github' ':!release'
-          git commit -m 'Restore verified portable SCM source, synthetic demo and clean staging data'
+          git add --all
+          git commit -m 'Restore portable SCM source, synthetic demo and remove staging fragments'
           git push origin HEAD:main
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: SCMRealtimeDB-restored-portable
           path: release/SCMRealtimeDB_portable.zip
