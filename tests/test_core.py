@@ -63,6 +63,19 @@ class Facts(Base):
     def test_initialize_without_migration_skips_backup(self):
         with patch.object(self.db,'backup',side_effect=AssertionError('unchanged schema must not trigger a full DB backup')):
             self.db.initialize(self.cfg)
+    def test_inbound_material_mapping_uses_matnr(self):
+        self.assertEqual(self.d['fields']['material'],'MATNR')
+    def test_legacy_pcode_database_migrates_to_matnr(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg=demo_config(ROOT);legacy=copy.deepcopy(cfg)
+            old=next(x for x in legacy['splunk_sources'] if x['id']=='inbound_dep')
+            old['fields']['material']='P_CODE'
+            db=Database(Path(td)/'legacy.sqlite',ROOT);db.initialize(legacy)
+            at=now_kst().replace(microsecond=0)-timedelta(minutes=5)
+            db.ingest(old,[event(old,key='LEG1',material='OLD-P-CODE',at=at,MATNR='DEMO_A')],int(time.time())-10,month_start_epoch())
+            self.assertEqual(db.query('SELECT material FROM inbound_current')[0]['material'],'OLD-P-CODE')
+            db.initialize(cfg)
+            self.assertEqual(db.query('SELECT material FROM inbound_current')[0]['material'],'DEMO_A')
     def test_latest_row_full(self):
         first=event(self.d,key='1',qty='100',at=self.at,PALLET='old')
         last=event(self.d,key='1',qty='200',at=self.at,changed=self.at+timedelta(minutes=5),PALLET='')
@@ -170,14 +183,32 @@ class References(Base):
         self.cfg['oracle_sources'][0]['mapping']['confirmed']=False
         result=self.masters();self.assertEqual(result['conversion']['status'],'MAPPING_REQUIRED')
         self.assertTrue(self.db.query('SELECT * FROM raw_oracle_conversion'))
-        self.assertFalse(self.db.query('SELECT * FROM dim_conversion'))
+        self.assertFalse(self.db.query('SELECT * FROM dim_conversion_component'))
     def test_conversion_exact(self):
         self.masters();self.ingest([event(self.d,at=self.at,qty='0.125')])
         self.assertEqual(self.db.query('SELECT eq_i FROM v_inbound_detail')[0]['eq_i'],250000)
     def test_conversion_refresh_revalues(self):
         self.masters();self.ingest([event(self.d,at=self.at,qty='100')])
-        t=fake_tables();t['conversion'][0]['FACTOR']='3';self.masters(t)
+        t=fake_tables();t['conversion'][0]['CONVEQQTY']='3';self.masters(t)
         self.assertEqual(self.db.query('SELECT eq_i FROM v_inbound_detail')[0]['eq_i'],300*SCALE)
+    def test_conversion_split_components_do_not_duplicate_raw_fact(self):
+        t=fake_tables();t['conversion'].append({'ITEM':'DEMO_A','YM':self.at.strftime('%Y%m'),'CONV_CODE':'K9-COMBO','CONVEQQTY':'3'})
+        self.masters(t);self.ingest([event(self.d,at=self.at,qty='100',box='BOX-COMBO')])
+        row=self.db.query("SELECT qty_i,ea_i,eq_i,eq_dram_i,eq_flash_i FROM v_inbound_detail WHERE material='DEMO_A'")[0]
+        self.assertEqual(row['qty_i'],100*SCALE);self.assertEqual(row['ea_i'],100*SCALE)
+        self.assertEqual(row['eq_dram_i'],200*SCALE);self.assertEqual(row['eq_flash_i'],300*SCALE)
+        self.assertEqual(row['eq_i'],500*SCALE)
+        daily=self.db.query('SELECT box_count,quantity FROM v_inbound_daily')[0]
+        self.assertEqual(daily['box_count'],1);self.assertEqual(daily['quantity'],100)
+    def test_conversion_is_common_to_shipment(self):
+        self.masters();ship=next(x for x in self.cfg['splunk_sources'] if x['domain']=='shipment')
+        self.ingest([event(ship,key='S1',material='DEMO_A',qty='50',at=self.at)],ship)
+        row=self.db.query("SELECT qty_i,eq_dram_i FROM v_shipment_detail WHERE material='DEMO_A'")[0]
+        self.assertEqual(row['qty_i'],50*SCALE);self.assertEqual(row['eq_dram_i'],100*SCALE)
+    def test_conversion_query_uses_requested_columns_without_product_prefilter(self):
+        sql=(ROOT/'config/queries/conversion.sql').read_text(encoding='utf-8')
+        self.assertIn('CONV_CODE',sql);self.assertIn('CONVEQQTY',sql)
+        self.assertNotIn('MST_PAX_ITEM',sql);self.assertNotIn(' EQQTY',sql.replace('CONVEQQTY',''))
     def test_no_refresh_on_local_select(self):
         self.masters()
         with patch('scm_db.connectors.oracle.OracleClient.stage',side_effect=AssertionError('external call')):
