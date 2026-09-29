@@ -72,6 +72,13 @@ def ensure_runtime():
     """Additive migration only. Never reset/drop a fact or user-owned table."""
     with contextlib.closing(connect(False)) as con:
         con.executescript(SCHEMA)
+        for table in ('inbound_current','shipment_current','shipment_box_current','inventory_current','shipment_amount_current'):
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                stem=table.removesuffix('_current')
+                con.execute(f'CREATE INDEX IF NOT EXISTS ix_{stem}_record ON {table}(record_key)')
+                con.execute(f'CREATE INDEX IF NOT EXISTS ix_{stem}_report ON {table}(plant,scope_ok,deleted,business_date)')
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shipment_amount_current'").fetchone():
+            con.execute('CREATE INDEX IF NOT EXISTS ix_shipment_amount_latest ON shipment_amount_current(record_key,modified_us DESC,generated_us DESC,indexed_us DESC,source_id)')
         columns={r['name'] for r in con.execute('PRAGMA table_info(shipment_amount_kzwi3)')}
         for name,kind in [('kzwi2','REAL'),('kunag','TEXT'),('soname','TEXT'),
                           ('kunnr','TEXT'),('shname','TEXT'),('werks','TEXT'),('lgort','TEXT')]:
